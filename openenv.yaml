@@ -1,0 +1,64 @@
+name: recommendation-policy-triage-env
+version: "1.0.0"
+description: >
+  A real-world OpenEnv environment for session-level recommendation policy
+  under memory uncertainty, repetition fatigue, novelty tolerance,
+  and intent drift.
+
+author: "Dibyajyoti001"
+tags:
+  - openenv
+  - recommendation
+  - recommender-systems
+  - reinforcement-learning
+  - session-policy
+  - memory
+  - real-world
+
+tasks:
+  - id: task_1
+    name: Stable Preference Exploitation
+    difficulty: easy
+    max_steps: 20
+    description: >
+      Historical memory is accurate and live intent matches it. The agent should
+      exploit reliable signals efficiently without wasting steps on unnecessary exploration.
+
+  - id: task_2
+    name: Repetition Fatigue Control
+    difficulty: medium
+    max_steps: 20
+    description: >
+      The user strongly prefers one category, but repeated recommendations create
+      fatigue and reduce long-term satisfaction. The agent must balance relevance and diversity.
+
+  - id: task_3
+    name: Memory vs Live Signal Conflict
+    difficulty: hard
+    max_steps: 20
+    description: >
+      Historical memory points to one category while recent session behavior points
+      to another. The agent must detect drift, override stale memory, and recover quickly.
+
+action_space:
+  type: structured
+  schema: Action
+
+observation_space:
+  type: structured
+  schema: Observation
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    response_model: Observation
+  step:
+    method: POST
+    path: /step
+    request_model: Action
+    response_model: StepResult
+  state:
+    method: GET
+    path: /state
+    response_model: EnvironmentState
