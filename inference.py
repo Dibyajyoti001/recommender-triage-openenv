@@ -6,16 +6,23 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import OpenAI
+from dotenv import load_dotenv
+load_dotenv()
 
 
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
 API_BASE_URL = os.getenv("API_BASE_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+# Environment server base URL
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
+
+# Logging metadata
+BENCHMARK = os.getenv("BENCHMARK", "recommendation-policy-triage")
+SESSION_ID = os.getenv("SESSION_ID", "default")
+
 MAX_STEPS = 20
 TIMEOUT = 60.0
-
 
 SYSTEM_PROMPT = """
 You control a recommendation-policy environment.
@@ -41,7 +48,7 @@ Guidelines:
 
 
 def require_env() -> None:
-    missing = []
+    missing: List[str] = []
     if not API_BASE_URL:
         missing.append("API_BASE_URL")
     if not MODEL_NAME:
@@ -50,6 +57,27 @@ def require_env() -> None:
         missing.append("HF_TOKEN")
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def fallback_action(obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,7 +104,7 @@ def fallback_action(obs: Dict[str, Any]) -> Dict[str, Any]:
         engagement = float(item.get("engagement", 0.0))
         freshness = item.get("freshness", "fresh")
 
-        score = 0.6 * quality + 0.2 * engagement
+        score = 0.60 * quality + 0.20 * engagement
 
         if cat == top_memory_cat:
             score += 0.10
@@ -169,50 +197,99 @@ def llm_action(client: OpenAI, obs: Dict[str, Any]) -> Dict[str, Any]:
         return fallback_action(obs)
 
 
+def action_to_log_string(action: Dict[str, Any]) -> str:
+    return json.dumps(action, separators=(",", ":"), ensure_ascii=False)
+
+
 def run_task(task_id: str, client: OpenAI, http: httpx.Client) -> Dict[str, Any]:
-    reset_resp = http.post(f"{ENV_BASE_URL}/reset", params={"task_id": task_id})
+    reset_resp = http.post(
+        f"{ENV_BASE_URL}/reset",
+        params={"task_id": task_id, "session_id": SESSION_ID},
+    )
     reset_resp.raise_for_status()
     obs = reset_resp.json()
 
     done = False
     step_count = 0
+    rewards: List[float] = []
     last_info: Dict[str, Any] = {}
+    success = False
+    score = 0.0
 
-    while not done and step_count < MAX_STEPS:
-        action = llm_action(client, obs)
-        step_resp = http.post(f"{ENV_BASE_URL}/step", json=action)
-        step_resp.raise_for_status()
-        data = step_resp.json()
+    task_name = obs.get("task_name", task_id)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME or "")
 
-        obs = data["observation"]
-        done = bool(data["done"])
-        last_info = data.get("info", {})
-        step_count += 1
-
-    # Prefer /grader, but tolerate using final_grade from the last step info.
-    score_payload: Optional[Dict[str, Any]] = None
     try:
-        grade_resp = http.get(f"{ENV_BASE_URL}/grader")
-        grade_resp.raise_for_status()
-        score_payload = grade_resp.json()
-    except Exception:
-        final_grade = last_info.get("final_grade")
-        if isinstance(final_grade, dict) and "final_score" in final_grade:
-            score_payload = {
-                "score": final_grade["final_score"],
-                "breakdown": final_grade,
-            }
+        while not done and step_count < MAX_STEPS:
+            action = llm_action(client, obs)
+            action_str = action_to_log_string(action)
 
-    if score_payload is None:
-        raise RuntimeError(f"Unable to retrieve final score for {task_id}")
+            error_msg: Optional[str] = None
+            reward = 0.0
 
-    return {
-        "task_id": task_id,
-        "steps": step_count,
-        "score": score_payload["score"],
-        "breakdown": score_payload["breakdown"],
-        "final_info": last_info,
-    }
+            try:
+                step_resp = http.post(
+                    f"{ENV_BASE_URL}/step",
+                    params={"session_id": SESSION_ID},
+                    json=action,
+                )
+                step_resp.raise_for_status()
+                data = step_resp.json()
+
+                obs = data["observation"]
+                done = bool(data["done"])
+                reward = float(data.get("reward", 0.0) or 0.0)
+                last_info = data.get("info", {})
+            except Exception as exc:
+                done = True
+                error_msg = str(exc)
+
+            step_count += 1
+            rewards.append(reward)
+            log_step(
+                step=step_count,
+                action=action_str,
+                reward=reward,
+                done=done,
+                error=error_msg,
+            )
+
+            if done:
+                break
+
+        score_payload: Optional[Dict[str, Any]] = None
+        try:
+            grade_resp = http.get(
+                f"{ENV_BASE_URL}/grader",
+                params={"session_id": SESSION_ID},
+            )
+            grade_resp.raise_for_status()
+            score_payload = grade_resp.json()
+        except Exception:
+            final_grade = last_info.get("final_grade")
+            if isinstance(final_grade, dict) and "final_score" in final_grade:
+                score_payload = {
+                    "score": final_grade["final_score"],
+                    "breakdown": final_grade,
+                }
+
+        if score_payload is not None:
+            score = float(score_payload.get("score", 0.0))
+            success = score > 0.0
+        else:
+            success = False
+            score = 0.0
+
+        return {
+            "task_id": task_id,
+            "steps": step_count,
+            "score": score,
+            "rewards": rewards,
+            "success": success,
+        }
+
+    finally:
+        log_end(success=success, steps=step_count, score=score, rewards=rewards)
 
 
 def main() -> None:
@@ -224,12 +301,9 @@ def main() -> None:
     )
 
     with httpx.Client(timeout=TIMEOUT) as http:
-        results = []
         for task_id in ["task_1", "task_2", "task_3"]:
-            results.append(run_task(task_id, client, http))
-
-    average_score = round(sum(r["score"] for r in results) / len(results), 6)
-    print(json.dumps({"results": results, "average_score": average_score}, indent=2))
+            run_task(task_id, client, http)
+            
 
 
 if __name__ == "__main__":

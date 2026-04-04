@@ -4,7 +4,7 @@ from collections import Counter
 from typing import Dict, List, Tuple
 
 from app.models import Action, Observation
-from app.simulator import RecommenderEnv
+from app.simulator import RecommendationPolicyEnvironment
 
 
 def history_only_action(obs: Observation) -> Action:
@@ -150,7 +150,7 @@ def evaluate_baseline(
     scores: List[float] = []
 
     for ep in range(episodes):
-        env = RecommenderEnv(seed=1000 + ep)
+        env = RecommendationPolicyEnvironment(seed=1000 + ep)
         obs = env.reset(task_id=task_id, seed=2000 + ep)
         done = False
 

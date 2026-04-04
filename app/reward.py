@@ -19,11 +19,30 @@ def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + exp(-x))
 
 
+def _one_hot(category_id: int, k: int) -> List[float]:
+    v = [0.0] * k
+    if 0 <= category_id < k:
+        v[category_id] = 1.0
+    return v
+
+
+def _topic_vector(item: CandidateItem, k: int) -> List[float]:
+    topic = getattr(item, "topic_vector", None) or item.metadata.get("topic_vector")
+    if isinstance(topic, list) and len(topic) == k:
+        cleaned = [max(0.0, float(x)) for x in topic]
+        s = sum(cleaned)
+        if s > 0:
+            return [x / s for x in cleaned]
+    return _one_hot(item.category_id, k)
+
+
+def _dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(sum(float(x) * float(y) for x, y in zip(a, b)))
+
+
 def relevance(alpha: float, eta_q: float, z: Sequence[float], m: Sequence[float], item: CandidateItem) -> float:
-    return float(
-        (alpha * z[item.category_id] + (1.0 - alpha) * m[item.category_id] + eta_q * item.quality)
-        / (1.0 + eta_q)
-    )
+    x = _topic_vector(item, len(z))
+    return float((alpha * _dot(z, x) + (1.0 - alpha) * _dot(m, x) + eta_q * item.quality) / (1.0 + eta_q))
 
 
 def category_fatigue_update(current: float, lambda_c: float, delta_c: float, chosen: bool) -> float:
@@ -31,7 +50,7 @@ def category_fatigue_update(current: float, lambda_c: float, delta_c: float, cho
 
 
 def item_fatigue_update(current: float, lambda_i: float, delta_i: float, chosen: bool) -> float:
-    return GLOBAL.lambda_i * current + (GLOBAL.delta_i if chosen else 0.0)
+    return lambda_i * current + (delta_i if chosen else 0.0)
 
 
 def fatigue_cost(
@@ -56,16 +75,9 @@ def novelty_violation(rho_t: float, nu: float) -> float:
     return float(max(0.0, rho_t - nu))
 
 
-def dissatisfaction(relevance_value: float, fatigue_value: float, novelty_value: float) -> float:
-    return float(
-        GLOBAL.gamma1 * (1.0 - relevance_value)
-        + GLOBAL.gamma2 * fatigue_value
-        + GLOBAL.gamma3 * novelty_value
-    )
-
-
-def update_patience(p_t: float, relevance_value: float, dissatisfaction_value: float) -> float:
-    return clip01(p_t + GLOBAL.beta_good * relevance_value - GLOBAL.beta_bad * dissatisfaction_value)
+def update_patience(p_t: float, y_t: float) -> float:
+    delta = GLOBAL.beta_patience * (2.0 * clip01(y_t) - 1.0)
+    return clip01(p_t + delta)
 
 
 def satisfaction_proxy(relevance_value: float, fatigue_value: float, novelty_value: float) -> float:
@@ -125,14 +137,27 @@ def compute_step_reward(
     repetition_window: int,
     w_c: float,
     w_i: float,
+    H_topic: Sequence[float] | None = None,
+    F_topic: Sequence[float] | None = None,
 ) -> Tuple[float, RewardBreakdown, Dict[str, float]]:
+    x = _topic_vector(item, len(z))
     r_t = relevance(alpha, eta_q, z, m, item)
-    c_fat = fatigue_cost(category_fatigue_value, item_fatigue_value, w_c=w_c, w_i=w_i)
-    rho_t = repetition_pressure(history_categories, item.category_id, repetition_window)
+
+    if F_topic is not None and len(F_topic) == len(x):
+        c_fat = _dot(F_topic, x)
+    else:
+        c_fat = fatigue_cost(category_fatigue_value, item_fatigue_value, w_c=w_c, w_i=w_i)
+
+    if H_topic is not None and len(H_topic) == len(x):
+        rho_t = _dot(H_topic, x)
+    else:
+        rho_t = repetition_pressure(history_categories, item.category_id, repetition_window)
+
     v_nov = novelty_violation(rho_t, nu)
     y_t = satisfaction_proxy(r_t, c_fat, v_nov)
     u_t = unnecessary_exploration_penalty(exploration_flag, chi_t)
     p_conf = confidence_overclaim_penalty(confidence_score, y_t)
+    alignment = _dot(z, m)
 
     raw = (
         GLOBAL.w_r * r_t
@@ -152,6 +177,8 @@ def compute_step_reward(
         raw_reward=float(round(raw, 6)),
         clipped_reward=float(round(clipped, 6)),
         satisfaction_proxy=float(round(y_t, 6)),
+        repetition_pressure=float(round(rho_t, 6)),
+        alignment=float(round(alignment, 6)),
     )
     aux = {
         "relevance": r_t,
@@ -159,5 +186,6 @@ def compute_step_reward(
         "repetition_pressure": rho_t,
         "novelty_violation": v_nov,
         "satisfaction_proxy": y_t,
+        "alignment": alignment,
     }
     return clipped, breakdown, aux

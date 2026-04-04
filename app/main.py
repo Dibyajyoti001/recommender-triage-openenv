@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .graders import FinalGradeBreakdown
 from .models import Action, EnvironmentState, GraderResponse, Observation, StepResult, TaskListResponse
-from .simulator import RecommenderEnv
+from .simulator import RecommendationPolicyEnvironment
 from .tasks import list_task_specs
 
 
@@ -20,7 +20,7 @@ app = FastAPI(
     ),
 )
 
-_SESSIONS: Dict[str, RecommenderEnv] = {}
+_SESSIONS: Dict[str, RecommendationPolicyEnvironment] = {}
 _DEFAULT_SESSION_ID = "default"
 
 
@@ -29,7 +29,7 @@ class BaselineResponse(BaseModel):
     average_score: float
 
 
-def _get_env(session_id: str = _DEFAULT_SESSION_ID) -> RecommenderEnv:
+def _get_env(session_id: str = _DEFAULT_SESSION_ID) -> RecommendationPolicyEnvironment:
     env = _SESSIONS.get(session_id)
     if env is None:
         raise HTTPException(status_code=400, detail="No active session. Call /reset first.")
@@ -106,7 +106,7 @@ def reset_endpoint(
     session_id: str = Query(default=_DEFAULT_SESSION_ID),
     seed: Optional[int] = Query(default=None),
 ) -> Observation:
-    env = RecommenderEnv()
+    env = RecommendationPolicyEnvironment()
     obs = env.reset(task_id=task_id, seed=seed)
     _SESSIONS[session_id] = env
     return obs
@@ -145,7 +145,7 @@ def baseline_endpoint(num_runs: int = Query(default=3, ge=1, le=20)) -> Baseline
     for task_id in ["task_1", "task_2", "task_3"]:
         scores: List[float] = []
         for run_idx in range(num_runs):
-            env = RecommenderEnv(seed=10_000 + run_idx)
+            env = RecommendationPolicyEnvironment(seed=10_000 + run_idx)
             obs = env.reset(task_id=task_id, seed=20_000 + run_idx)
 
             done = False
