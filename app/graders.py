@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import exp, log
-from typing import Dict, List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from .models import FinalGradeBreakdown
 from .tasks import K, GLOBAL, TaskConfig, get_task_config
@@ -10,6 +10,18 @@ from .tasks import K, GLOBAL, TaskConfig, get_task_config
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
+
+def _argmax(v: Sequence[float]) -> int:
+    return int(max(range(len(v)), key=lambda i: v[i]))
+
+
+def _dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(sum(float(x) * float(y) for x, y in zip(a, b)))
+
+
+def _l1(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(sum(abs(float(x) - float(y)) for x, y in zip(a, b)))
 
 
 @dataclass
@@ -41,27 +53,38 @@ def diversity_grade(traj: Sequence[TrajectoryStep], nu: float) -> float:
 
     counts = [0] * K
     for step in traj:
-        counts[step.chosen_category_id] += 1
+        if 0 <= step.chosen_category_id < K:
+            counts[step.chosen_category_id] += 1
 
     probs = [c / len(traj) for c in counts if c > 0]
+    if not probs:
+        return 0.0
+
     entropy = -sum(p * log(p) for p in probs)
     h_max = log(K)
     h_star = nu * h_max
     return _clip01(1.0 - min(1.0, abs(entropy - h_star) / h_max))
 
 
-def detect_drift_turn(traj: Sequence[TrajectoryStep], tau: float) -> Optional[int]:
+def detect_drift_turn(
+    traj: Sequence[TrajectoryStep],
+    *,
+    task_id: str,
+    tau: float,
+) -> Optional[int]:
     """
-    Exact frozen-spec drift rule:
+    Drift detection logic:
 
-    t* = first t where:
-      p_t <= tau AND argmax(z_{t+1}) != argmax(z_t)
+    Task 1 / Task 2:
+        Keep the original conservative rule:
+            p_after <= tau AND argmax(z_t) != argmax(z_{t+1})
 
-    Since each trajectory step stores z before the transition and p_before/p_after,
-    we operationalize this as:
-      p_after <= tau AND argmax(z_t_before) != argmax(z_{t+1}_before)
-
-    where z_{t+1}_before is the next step's stored z.
+    Task 3:
+        Detect the first *real* live-intent shift between consecutive stored z states.
+        Since the environment now injects a deliberate conflict event, we detect drift if:
+            - argmax changes, OR
+            - L1 shift in z is large enough, OR
+            - alignment with memory drops enough
     """
     if len(traj) < 2:
         return None
@@ -69,10 +92,29 @@ def detect_drift_turn(traj: Sequence[TrajectoryStep], tau: float) -> Optional[in
     for i in range(len(traj) - 1):
         curr = traj[i]
         nxt = traj[i + 1]
-        curr_argmax = int(max(range(len(curr.z)), key=lambda j: curr.z[j]))
-        next_argmax = int(max(range(len(nxt.z)), key=lambda j: nxt.z[j]))
-        if curr.p_after <= tau and curr_argmax != next_argmax:
+
+        curr_argmax = _argmax(curr.z)
+        next_argmax = _argmax(nxt.z)
+
+        if task_id != "task_3":
+            if curr.p_after <= tau and curr_argmax != next_argmax:
+                return i
+            continue
+
+        # Task 3: robust drift detection
+        z_shift = _l1(curr.z, nxt.z)
+        mem_align_curr = _dot(curr.m, curr.z)
+        mem_align_next = _dot(nxt.m, nxt.z)
+        align_drop = mem_align_curr - mem_align_next
+
+        # A real shift should not be tiny noise.
+        if (
+            curr_argmax != next_argmax
+            or z_shift >= 0.30
+            or align_drop >= 0.08
+        ):
             return i
+
     return None
 
 
@@ -82,9 +124,7 @@ def detect_recovery_turn(
     theta_rec: float,
 ) -> Optional[int]:
     """
-    Exact frozen-spec recovery rule:
-
-    recovery occurs at first t >= t* + 2 such that:
+    Recovery occurs at first t >= drift_turn + 2 such that:
       avg_3(relevance) >= theta_rec
       avg_3(satisfaction_proxy) >= 0.60
     """
@@ -103,13 +143,21 @@ def detect_recovery_turn(
 def adaptation_grade(
     traj: Sequence[TrajectoryStep],
     *,
+    task_id: str,
     tau: float,
     theta_rec: float,
     lambda_A: float,
-) -> tuple[float, Optional[int], Optional[int]]:
-    drift_turn = detect_drift_turn(traj, tau=tau)
-    if drift_turn is None:
-        return 1.0, None, None
+) -> Tuple[float, Optional[int], Optional[int]]:
+    drift_turn = detect_drift_turn(traj, task_id=task_id, tau=tau)
+
+    # For non-drift tasks, no drift is fine.
+    if task_id != "task_3":
+        if drift_turn is None:
+            return 1.0, None, None
+
+    # For Task 3, no drift means the environment/policy failed to surface the conflict.
+    if task_id == "task_3" and drift_turn is None:
+        return 0.0, None, None
 
     recovery_turn = detect_recovery_turn(traj, drift_turn, theta_rec)
     if recovery_turn is None:
@@ -121,27 +169,35 @@ def adaptation_grade(
 
 def memory_use_grade(traj: Sequence[TrajectoryStep]) -> float:
     """
-    Exact frozen-spec memory-use grader.
+    Memory-use grading:
+      - reward using memory when memory is still trustworthy and aligned
+      - reward NOT using memory when live intent has diverged
 
-    Let:
-      k_m = argmax_k m[k]
-      k_z = argmax_k z_t[k]
+    We use:
+      alignment_t = m · z_t
 
-    I_t = 1 if chi_t >= 0.60 and m[k_m] - z_t[k_z] >= -0.05 else 0
-    J_t = 1 if chosen category == k_m else 0
+      I_t = 1 if memory should be trusted
+          = 1 if (chi_t >= 0.60 and alignment_t >= 0.16)
+            else 0
 
-    M(tau) = average_t 1[I_t == J_t]
+      J_t = 1 if chosen category == argmax(m)
+            else 0
+
+      Score = average_t 1[I_t == J_t]
     """
     if not traj:
         return 0.0
 
     matches = 0
     for step in traj:
-        k_m = int(max(range(len(step.m)), key=lambda i: step.m[i]))
-        k_z = int(max(range(len(step.z)), key=lambda i: step.z[i]))
-        I_t = 1 if (step.memory_confidence >= 0.60 and (step.m[k_m] - step.z[k_z] >= -0.05)) else 0
+        k_m = _argmax(step.m)
+        alignment_t = _dot(step.m, step.z)
+
+        I_t = 1 if (step.memory_confidence >= 0.60 and alignment_t >= 0.16) else 0
         J_t = 1 if step.chosen_category_id == k_m else 0
-        matches += 1 if I_t == J_t else 0
+
+        if I_t == J_t:
+            matches += 1
 
     return _clip01(matches / len(traj))
 
@@ -153,6 +209,7 @@ def final_grade(traj: Sequence[TrajectoryStep], task_id: str) -> FinalGradeBreak
     d = diversity_grade(traj, cfg.nu)
     a, drift_turn, recovery_turn = adaptation_grade(
         traj,
+        task_id=task_id,
         tau=cfg.tau,
         theta_rec=GLOBAL.theta_rec,
         lambda_A=GLOBAL.lambda_A,

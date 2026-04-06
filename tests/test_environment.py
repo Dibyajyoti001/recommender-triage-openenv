@@ -1,9 +1,9 @@
-from app.simulator import RecommenderEnv
+from app.simulator import RecommendationPolicyEnvironment
 from app.models import Action
 
 
 def test_environment_reset_and_step():
-    env = RecommenderEnv(seed=123)
+    env = RecommendationPolicyEnvironment(seed=123)
     obs = env.reset("task_1", seed=456)
     assert obs.task_id == "task_1"
     assert len(obs.candidate_items) == 6

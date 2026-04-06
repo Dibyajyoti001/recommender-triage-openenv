@@ -1,12 +1,26 @@
 from __future__ import annotations
 
-from collections import Counter
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from .models import CandidateItem
 from .tasks import CATEGORY_NAMES, K, get_task_config
+
+
+def _normalize(v: Sequence[float]) -> List[float]:
+    arr = np.asarray(v, dtype=float)
+    arr = np.maximum(arr, 0.0)
+    s = float(arr.sum())
+    if s <= 0:
+        arr = np.ones_like(arr) / len(arr)
+    else:
+        arr = arr / s
+    return [float(x) for x in arr]
+
+
+def _uniform(k: int) -> List[float]:
+    return [1.0 / k for _ in range(k)]
 
 
 def _style_vec(rng: np.random.Generator) -> List[float]:
@@ -19,6 +33,18 @@ def _title(category_name: str, freshness: str, slot_type: str, idx: int) -> str:
     return f"{category_name} :: {freshness} :: {slot_type} :: {idx}"
 
 
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _sample_quality(rng: np.random.Generator, lo: float, hi: float) -> float:
+    return float(rng.uniform(lo, hi))
+
+
+def _primary_category(topic_vector: Sequence[float]) -> int:
+    return int(np.argmax(np.asarray(topic_vector, dtype=float)))
+
+
 def _least_recent_category(history_categories: Sequence[int]) -> int:
     if not history_categories:
         return 0
@@ -28,55 +54,66 @@ def _least_recent_category(history_categories: Sequence[int]) -> int:
     return min(last_seen, key=last_seen.get)
 
 
-def _top_non_targets(scores: Sequence[float], banned: Sequence[int], count: int = 2) -> List[int]:
-    candidates = [(i, s) for i, s in enumerate(scores) if i not in banned]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return [i for i, _ in candidates[:count]]
+def _anti_distribution(v: Sequence[float]) -> List[float]:
+    arr = np.asarray(v, dtype=float)
+    arr = 1.0 - arr
+    arr = np.maximum(arr, 1e-6)
+    arr = arr / float(arr.sum())
+    return [float(x) for x in arr]
 
 
-def _clip01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+def _to_sparse(v: Sequence[float], max_topics: int = 3, min_keep: float = 0.10) -> List[float]:
+    arr = np.asarray(v, dtype=float)
+    arr = np.maximum(arr, 0.0)
+
+    if arr.sum() <= 0:
+        arr = np.ones_like(arr)
+
+    top_idx = np.argsort(arr)[::-1][:max_topics]
+    mask = np.zeros_like(arr, dtype=bool)
+    mask[top_idx] = True
+    mask = np.logical_or(mask, arr >= min_keep)
+
+    sparse = np.where(mask, arr, 0.0)
+    if sparse.sum() <= 0:
+        sparse[np.argmax(arr)] = arr[np.argmax(arr)]
+
+    sparse = sparse / float(sparse.sum())
+    return [float(x) for x in sparse]
 
 
-def _sample_quality(rng: np.random.Generator, lo: float, hi: float) -> float:
-    return float(rng.uniform(lo, hi))
+def _blend_sparse(*parts: Sequence[float]) -> List[float]:
+    arr = np.sum(np.asarray(parts, dtype=float), axis=0)
+    return _to_sparse(arr, max_topics=3, min_keep=0.10)
 
 
 def _make_item(
     *,
     item_id: int,
-    category_id: int,
+    topic_vector: Sequence[float],
     quality: float,
     freshness: str,
     slot_type: str,
     rng: np.random.Generator,
-    metadata: Dict[str, float | int | str],
+    metadata: Dict[str, float | int | str | List[float]],
 ) -> CandidateItem:
+    x = _to_sparse(topic_vector, max_topics=3, min_keep=0.10)
+    category_id = _primary_category(x)
     category_name = CATEGORY_NAMES[category_id]
     engagement = _clip01(0.55 * quality + 0.45 * float(rng.uniform(0.35, 0.95)))
     return CandidateItem(
         item_id=item_id,
         title=_title(category_name, freshness, slot_type, item_id),
         category_id=category_id,
-        category_name=category_name,  # type: ignore[list-item]
+        category_name=category_name,
         quality=float(round(quality, 4)),
         engagement=float(round(engagement, 4)),
-        freshness=freshness,  # type: ignore[arg-type]
+        freshness=freshness,
         style_vector=_style_vec(rng),
         slot_type=slot_type,
         metadata=metadata,
+        topic_vector=x,
     )
-
-
-def _relevance(
-    alpha: float,
-    eta_q: float,
-    z: Sequence[float],
-    m: Sequence[float],
-    category_id: int,
-    quality: float,
-) -> float:
-    return float((alpha * z[category_id] + (1.0 - alpha) * m[category_id] + eta_q * quality) / (1.0 + eta_q))
 
 
 def build_candidate_pool(
@@ -87,178 +124,118 @@ def build_candidate_pool(
     eta_q: float,
     z: Sequence[float],
     m: Sequence[float],
-    item_fatigue: Dict[int, float],
+    item_fatigue: Optional[Dict[int, float]],
     history_categories: Sequence[int],
     rng: np.random.Generator,
+    H_topic: Optional[Sequence[float]] = None,
+    F_topic: Optional[Sequence[float]] = None,
 ) -> List[CandidateItem]:
-    """
-    Exact 6-slot candidate pool:
-      1. live-best fresh
-      2. live-best fatigued
-      3. memory-best fresh
-      4. plausible distractor
-      5. novel risky distractor
-      6. random neutral filler
-
-    Plus task-specific tweaks and quality/relevance constraints from the frozen design.
-    """
     cfg = get_task_config(task_id)
 
-    k_z = int(np.argmax(np.asarray(z)))
-    k_m = int(np.argmax(np.asarray(m)))
+    z_vec = _normalize(z)
+    m_vec = _normalize(m)
+    h_vec = _normalize(H_topic if H_topic is not None else _uniform(K))
+    f_raw = F_topic if F_topic is not None and sum(F_topic) > 1e-8 else _uniform(K)
+    f_vec = _normalize(f_raw)
+    u_vec = _uniform(K)
+    anti_m = _anti_distribution(m_vec)
+    anti_z = _anti_distribution(z_vec)
 
-    # Task 1: bias alignment, do not hard-force every time.
-    if task_id == "task_1" and rng.uniform() < 0.75:
-        k_m = k_z
+    k_z = int(np.argmax(np.asarray(z_vec)))
+    k_m = int(np.argmax(np.asarray(m_vec)))
+    least_recent = _least_recent_category(history_categories)
+    least_recent_oh = [1.0 if i == least_recent else 0.0 for i in range(K)]
 
-    # Task 3: force conflict.
-    if task_id == "task_3" and k_z == k_m:
-        k_z = (k_m + 1) % K
+    balanced = _blend_sparse(
+        [(1.0 - cfg.omega_mix) * z_vec[i] for i in range(K)],
+        [cfg.omega_mix * m_vec[i] for i in range(K)],
+    )
 
-    non_targets = _top_non_targets(np.asarray(m) + np.asarray(z), banned=[k_z, k_m], count=2)
-    plausible_cat = non_targets[0] if non_targets else (k_z + 1) % K
+    fatigue_trap = _blend_sparse(
+        [0.60 * z_vec[i] for i in range(K)],
+        [0.25 * f_vec[i] for i in range(K)],
+        [0.15 * h_vec[i] for i in range(K)],
+    )
 
-    risky_cat = _least_recent_category(history_categories)
-    if risky_cat in {k_z, k_m, plausible_cat}:
-        for cand in range(K):
-            if cand not in {k_z, k_m, plausible_cat}:
-                risky_cat = cand
-                break
+    exploration = _blend_sparse(
+        [0.45 * z_vec[i] for i in range(K)],
+        [0.35 * (1.0 - f_vec[i]) for i in range(K)],
+        [0.20 * least_recent_oh[i] for i in range(K)],
+    )
 
-    filler_choices = [c for c in range(K) if c not in {k_z, k_m, plausible_cat, risky_cat}]
-    neutral_cat = filler_choices[0] if filler_choices else (k_z + 2) % K
+    if task_id == "task_3":
+        s = cfg.conflict_strength
+        conflict = _blend_sparse(
+            [(1.0 - s) * u_vec[i] for i in range(K)],
+            [s * anti_m[i] for i in range(K)],
+        )
+    else:
+        s = min(0.55, cfg.conflict_strength)
+        conflict = _blend_sparse(
+            [(1.0 - s) * anti_z[i] for i in range(K)],
+            [s * anti_m[i] for i in range(K)],
+        )
 
-    # Task 2: increase same-category temptation while keeping structure valid.
-    if task_id == "task_2" and rng.uniform() < 0.30:
-        neutral_cat = k_z
+    live_vec = _blend_sparse(
+        [0.70 * z_vec[i] for i in range(K)],
+        [0.20 * least_recent_oh[i] for i in range(K)],
+        [0.10 * u_vec[i] for i in range(K)],
+    )
+
+    mem_vec = _blend_sparse(
+        [0.66 * m_vec[i] for i in range(K)],
+        [0.20 * u_vec[i] for i in range(K)],
+        [0.14 * z_vec[i] for i in range(K)],
+    )
+
+    if task_id == "task_1" and rng.uniform() < 0.70:
+        live_vec = _blend_sparse(
+            [0.78 * m_vec[i] for i in range(K)],
+            [0.22 * z_vec[i] for i in range(K)],
+        )
+
+    if task_id == "task_2":
+        fatigue_trap = _blend_sparse(
+            [0.70 * z_vec[i] for i in range(K)],
+            [0.20 * h_vec[i] for i in range(K)],
+            [0.10 * f_vec[i] for i in range(K)],
+        )
 
     next_id_base = turn * 10_000 + 100
-
     items: List[CandidateItem] = []
 
-    # 1. live-best fresh
-    q1 = _sample_quality(rng, 0.75, 0.95)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 1,
-            category_id=k_z,
-            quality=q1,
-            freshness="fresh",
-            slot_type="live_best_fresh",
-            rng=rng,
-            metadata={"target": "live", "fatigue_hint": 0.0},
-        )
-    )
+    item_specs = [
+        ("live_best_fresh", live_vec, _sample_quality(rng, 0.75, 0.95), "fresh"),
+        ("memory_best_fresh", mem_vec, _sample_quality(rng, 0.70, 0.90), "fresh"),
+        ("balanced_bridge", balanced, _sample_quality(rng, 0.64, 0.84), "fresh"),
+        ("fatigue_trap", fatigue_trap, _sample_quality(rng, 0.62, 0.82), "stale"),
+        ("exploration_option", exploration, _sample_quality(rng, 0.45, 0.68), "novel"),
+        ("conflict_option", conflict, _sample_quality(rng, 0.56, 0.80), "fresh"),
+    ]
 
-    # 2. live-best fatigued
-    q2 = _sample_quality(rng, 0.70, 0.90)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 2,
-            category_id=k_z,
-            quality=q2,
-            freshness="stale",
-            slot_type="live_best_fatigued",
-            rng=rng,
-            metadata={"target": "live", "fatigue_hint": 1.0},
-        )
-    )
+    for idx, (slot_type, topic_vec, quality, freshness) in enumerate(item_specs, start=1):
+        topic_vec_sparse = _to_sparse(topic_vec, max_topics=3, min_keep=0.10)
+        fatigue_hint = float(sum(float(a) * float(b) for a, b in zip(f_vec, topic_vec_sparse)))
+        repetition_hint = float(sum(float(a) * float(b) for a, b in zip(h_vec, topic_vec_sparse)))
 
-    # 3. memory-best fresh
-    q3 = _sample_quality(rng, 0.70, 0.90)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 3,
-            category_id=k_m,
-            quality=q3,
-            freshness="fresh",
-            slot_type="memory_best_fresh",
-            rng=rng,
-            metadata={"target": "memory", "fatigue_hint": 0.0},
-        )
-    )
-
-    # 4. plausible distractor
-    distractor_hi = 0.62 if task_id == "task_1" else 0.70
-    q4 = _sample_quality(rng, 0.45, distractor_hi)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 4,
-            category_id=plausible_cat,
-            quality=q4,
-            freshness="fresh",
-            slot_type="plausible_distractor",
-            rng=rng,
-            metadata={"target": "distractor", "fatigue_hint": 0.0},
-        )
-    )
-
-    # 5. novel risky distractor
-    q5 = _sample_quality(rng, 0.35, 0.60)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 5,
-            category_id=risky_cat,
-            quality=q5,
-            freshness="novel",
-            slot_type="novel_risky_distractor",
-            rng=rng,
-            metadata={"target": "novel", "fatigue_hint": 0.0},
-        )
-    )
-
-    # 6. random neutral filler
-    q6 = _sample_quality(rng, 0.40, 0.65)
-    items.append(
-        _make_item(
-            item_id=next_id_base + 6,
-            category_id=neutral_cat,
-            quality=q6,
-            freshness="fresh",
-            slot_type="neutral_filler",
-            rng=rng,
-            metadata={"target": "neutral", "fatigue_hint": 0.0},
-        )
-    )
-
-    # Frozen quality-gap constraint:
-    # q_live_fresh >= q_memory_fresh - 0.05
-    if items[0].quality < items[2].quality - 0.05:
-        adjusted_q1 = min(items[2].quality - 0.03, 0.95)
-        items[0] = items[0].model_copy(update={"quality": float(round(adjusted_q1, 4))})
-
-    # Frozen task-3 relevance-gap constraint:
-    # |R(live-fresh) - R(memory-fresh)| <= 0.15
-    if task_id == "task_3":
-        r_live = _relevance(alpha, eta_q, z, m, items[0].category_id, items[0].quality)
-        r_mem = _relevance(alpha, eta_q, z, m, items[2].category_id, items[2].quality)
-        gap = abs(r_live - r_mem)
-
-        if gap > 0.15:
-            if r_live > r_mem:
-                new_q3 = min(items[2].quality + min(0.10, gap / 2.0), 0.92)
-                items[2] = items[2].model_copy(update={"quality": float(round(new_q3, 4))})
-            else:
-                new_q1 = min(items[0].quality + min(0.10, gap / 2.0), 0.95)
-                items[0] = items[0].model_copy(update={"quality": float(round(new_q1, 4))})
-
-    # Compute category-level fatigue hints from recent history.
-    recent_counts = Counter(history_categories[-4:])
-    rewritten: List[CandidateItem] = []
-    for item in items:
-        fatigue_hint = float(recent_counts.get(item.category_id, 0))
-        if item.slot_type == "live_best_fatigued":
-            fatigue_hint += 1.0
-
-        rewritten.append(
-            item.model_copy(
-                update={
-                    "metadata": {
-                        **item.metadata,
-                        "fatigue_hint": float(round(fatigue_hint, 4)),
-                    }
-                }
+        items.append(
+            _make_item(
+                item_id=next_id_base + idx,
+                topic_vector=topic_vec_sparse,
+                quality=quality,
+                freshness=freshness,
+                slot_type=slot_type,
+                rng=rng,
+                metadata={
+                    "target": slot_type,
+                    "fatigue_hint": float(round(fatigue_hint, 4)),
+                    "repetition_hint": float(round(repetition_hint, 4)),
+                    "topic_vector": topic_vec_sparse,
+                    "live_category": k_z,
+                    "memory_category": k_m,
+                    "topic_order": CATEGORY_NAMES,
+                },
             )
         )
 
-    return rewritten
+    return items

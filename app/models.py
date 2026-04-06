@@ -5,7 +5,18 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-CategoryName = Literal["Documentary", "Comedy", "Thriller", "News", "Lifestyle"]
+CategoryName = Literal[
+    "Romance",
+    "Comedy",
+    "Drama",
+    "Thriller",
+    "Action",
+    "Documentary",
+    "Crime",
+    "SciFi",
+    "News",
+    "Lifestyle",
+]
 FeedbackBucket = Literal["low", "neutral", "positive", "strong_positive"]
 PressureBucket = Literal["low", "medium", "high"]
 ConfidenceBucket = Literal["weak", "moderate", "strong"]
@@ -16,13 +27,9 @@ class CandidateItem(BaseModel):
     """
     A single candidate shown to the agent.
 
-    `slot_type` encodes the exact candidate-pool template used by the environment:
-    - live_best_fresh
-    - live_best_fatigued
-    - memory_best_fresh
-    - plausible_distractor
-    - novel_risky_distractor
-    - neutral_filler
+    `topic_vector` is the canonical mixed-topic sparse representation over the
+    fixed global basis from tasks.py -> CATEGORY_NAMES.
+    `category_id` / `category_name` are the primary topic only (argmax).
     """
 
     item_id: int
@@ -35,6 +42,7 @@ class CandidateItem(BaseModel):
     style_vector: List[float]
     slot_type: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    topic_vector: List[float] = Field(default_factory=list)
 
 
 class RecentInteraction(BaseModel):
@@ -92,6 +100,8 @@ class RewardBreakdown(BaseModel):
     raw_reward: float
     clipped_reward: float
     satisfaction_proxy: float
+    repetition_pressure: float = 0.0
+    alignment: float = 0.0
 
 
 class StepResult(BaseModel):
@@ -108,13 +118,18 @@ class HiddenState(BaseModel):
 
     task_id: str
     turn: int
-    m: List[float]  # long-term memory distribution over categories
-    z: List[float]  # live intent distribution over categories
-    F_cat: List[float]  # category fatigue
-    F_item: Dict[int, float]  # item fatigue keyed by item_id
-    nu: float  # novelty tolerance
-    p: float  # patience
-    chi: float  # memory confidence
+    m: List[float]          # long-term memory preference over fixed 10-topic basis
+    z: List[float]          # live session intent over fixed 10-topic basis
+    H_topic: List[float]    # EMA history pressure over fixed 10-topic basis
+    F_topic: List[float]    # fatigue accumulator over fixed 10-topic basis
+    history_topic_vectors: List[List[float]] = Field(default_factory=list)
+
+    # Compatibility fields preserved for earlier code / graders / inspection
+    F_cat: List[float]
+    F_item: Dict[int, float]
+    nu: float
+    p: float
+    chi: float
     history_item_ids: List[int]
     history_category_ids: List[int]
     drift_turn: Optional[int] = None
@@ -141,7 +156,7 @@ class TaskSpec(BaseModel):
     description: str
     max_turns: int
     grader_weights: Dict[str, float]
-    parameters: Dict[str, float]
+    parameters: Dict[str, Any]
 
 
 class TaskListResponse(BaseModel):
@@ -155,7 +170,7 @@ class GraderResponse(BaseModel):
 
 class EnvironmentState(BaseModel):
     """
-    Debuggable environment state.
+    Full environment state for debugging.
     """
 
     hidden_state: HiddenState
