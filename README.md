@@ -6,7 +6,7 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
-short_description: OpenEnv benchmark for session-level recommendation under memory uncertainty, repetition fatigue, and intent drift.
+short_description:short_description: OpenEnv benchmark for session-level recommendation.
 ---
 
 # Recommendation Policy Triage
