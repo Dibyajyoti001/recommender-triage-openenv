@@ -18,8 +18,8 @@ It models recommendation as a sequential control problem rather than a static ra
 **Team:** Neonatal  
 **Authors:** Dibyajyoti001, ankannayek
 
-**Hugging Face Space:** `soon`  
-**OpenAPI Docs:** `soon`
+**Hugging Face Space:** `https://dibyajyoti001-recommender-triage-openenv.hf.space`  
+
 
 ---
 
@@ -358,6 +358,7 @@ docker run --rm -p 7860:7860 \
 ```
 recommender-triage-openenv/
 ├── app/
+│   ├── __init__.py
 │   ├── main.py           
 │   ├── models.py         
 │   ├── tasks.py          
@@ -366,14 +367,27 @@ recommender-triage-openenv/
 │   ├── graders.py        
 │   ├── candidate_pool.py 
 │   └── data.py 
+├── server/
+│   ├── __init__.py
+│   └── app.py
 ├── tests/
+│   ├── conftest.py
+│   ├── test_candidate_pool.py
+│   ├── test_environment.py
+│   ├── test_graders.py
+│   ├── test_smoke.py
+│   └── test_tasks.py
 ├── inference.py          
 ├── baselines.py          
 ├── client.py             
 ├── openenv.yaml          
 ├── Dockerfile
 ├── requirements.txt
-└── pyproject.toml
+├── pyproject.toml
+├── uv.lock
+├── .env.example
+├── .gitignore
+└── .dockerignore
 ```
 ---
 
