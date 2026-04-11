@@ -80,8 +80,72 @@ def update_patience(p_t: float, y_t: float) -> float:
     return clip01(p_t + delta)
 
 
-def satisfaction_proxy(relevance_value: float, fatigue_value: float, novelty_value: float) -> float:
-    return clip01(sigmoid(GLOBAL.zeta1 * relevance_value - GLOBAL.zeta2 * fatigue_value - GLOBAL.zeta3 * novelty_value))
+def calibration_target(feedback_volatility: float, decay_k: float) -> float:
+    return clip01(exp(-decay_k * max(0.0, feedback_volatility)))
+
+
+def resource_pressure(
+    item: CandidateItem,
+    *,
+    budget_remaining: float,
+    risk_tolerance: float,
+    latency_budget: float,
+    eps: float = 1e-6,
+) -> float:
+    return clip01(
+        0.45 * item.cost / max(budget_remaining, eps)
+        + 0.30 * item.latency / max(latency_budget, eps)
+        + 0.25 * item.risk / max(risk_tolerance, eps)
+    )
+
+
+def diversity_pressure(
+    repetition_pressure_value: float,
+    novelty_value: float,
+    concentration_recent: float,
+) -> float:
+    return clip01(
+        0.60 * repetition_pressure_value
+        + 0.25 * novelty_value
+        + 0.15 * concentration_recent
+    )
+
+
+def risk_exposure(
+    confidence_overclaim: float,
+    feedback_volatility: float,
+    repetition_pressure_value: float,
+    item_risk: float,
+) -> float:
+    return clip01(
+        0.35 * confidence_overclaim
+        + 0.25 * feedback_volatility
+        + 0.20 * repetition_pressure_value
+        + 0.20 * item_risk
+    )
+
+
+def satisfaction_proxy(
+    relevance_value: float,
+    fatigue_value: float,
+    novelty_value: float,
+    *,
+    trust_level: float,
+    trust_sensitivity: float,
+    satisfaction_cap: float | None = None,
+) -> float:
+    trust_bonus = GLOBAL.zeta4 * trust_sensitivity * (clip01(trust_level) - 0.5)
+    y = clip01(
+        sigmoid(
+            GLOBAL.zeta1 * relevance_value
+            - GLOBAL.zeta2 * fatigue_value
+            - GLOBAL.zeta3 * novelty_value
+            + trust_bonus
+        )
+    )
+    if satisfaction_cap is not None:
+        y = min(y, satisfaction_cap)
+    return y
 
 
 def unnecessary_exploration_penalty(exploration_flag: bool, chi_t: float) -> float:
@@ -120,6 +184,18 @@ def confidence_bucket(chi_t: float) -> str:
     return "strong"
 
 
+def engagement_bucket(p_t: float) -> str:
+    if p_t < 0.34:
+        return "fragile"
+    if p_t < 0.67:
+        return "stable"
+    return "engaged"
+
+
+def _is_exploratory_item(item: CandidateItem) -> bool:
+    return item.slot_type in {"exploration_option", "conflict_option"}
+
+
 def compute_step_reward(
     *,
     alpha: float,
@@ -139,6 +215,16 @@ def compute_step_reward(
     w_i: float,
     H_topic: Sequence[float] | None = None,
     F_topic: Sequence[float] | None = None,
+    trust_level: float = 0.5,
+    trust_sensitivity: float = 1.0,
+    feedback_volatility: float = 0.0,
+    calibration_decay_k: float = 8.0,
+    confidence_penalty_weight: float | None = None,
+    budget_remaining: float = 1.0,
+    risk_tolerance: float = 1.0,
+    latency_budget: float = 1.0,
+    concentration_recent: float = 0.0,
+    satisfaction_cap: float | None = None,
 ) -> Tuple[float, RewardBreakdown, Dict[str, float]]:
     x = _topic_vector(item, len(z))
     r_t = relevance(alpha, eta_q, z, m, item)
@@ -154,17 +240,37 @@ def compute_step_reward(
         rho_t = repetition_pressure(history_categories, item.category_id, repetition_window)
 
     v_nov = novelty_violation(rho_t, nu)
-    y_t = satisfaction_proxy(r_t, c_fat, v_nov)
-    u_t = unnecessary_exploration_penalty(exploration_flag, chi_t)
+    y_t = satisfaction_proxy(
+        r_t,
+        c_fat,
+        v_nov,
+        trust_level=trust_level,
+        trust_sensitivity=trust_sensitivity,
+        satisfaction_cap=satisfaction_cap,
+    )
+    actual_exploration = bool(exploration_flag or _is_exploratory_item(item))
+    u_t = unnecessary_exploration_penalty(actual_exploration, chi_t)
     p_conf = confidence_overclaim_penalty(confidence_score, y_t)
     alignment = _dot(z, m)
+    c_target = calibration_target(feedback_volatility, calibration_decay_k)
+    c_gap = abs(confidence_score - c_target)
+    trust_bonus = GLOBAL.zeta4 * trust_sensitivity * (clip01(trust_level) - 0.5)
+    conf_weight = GLOBAL.w_conf if confidence_penalty_weight is None else confidence_penalty_weight
+    res_pressure = resource_pressure(
+        item,
+        budget_remaining=budget_remaining,
+        risk_tolerance=risk_tolerance,
+        latency_budget=latency_budget,
+    )
+    risk_value = risk_exposure(p_conf, feedback_volatility, rho_t, item.risk)
+    div_pressure = diversity_pressure(rho_t, v_nov, concentration_recent)
 
     raw = (
         GLOBAL.w_r * r_t
         - GLOBAL.w_f * c_fat
         - GLOBAL.w_n * v_nov
         - GLOBAL.w_u * u_t
-        - GLOBAL.w_conf * p_conf
+        - conf_weight * p_conf
     )
     clipped = clip_reward(raw)
 
@@ -174,6 +280,12 @@ def compute_step_reward(
         novelty_violation=float(round(v_nov, 6)),
         unnecessary_exploration=float(round(u_t, 6)),
         confidence_penalty=float(round(p_conf, 6)),
+        trust_bonus=float(round(trust_bonus, 6)),
+        calibration_target=float(round(c_target, 6)),
+        calibration_gap=float(round(c_gap, 6)),
+        resource_pressure=float(round(res_pressure, 6)),
+        risk_exposure=float(round(risk_value, 6)),
+        diversity_pressure=float(round(div_pressure, 6)),
         raw_reward=float(round(raw, 6)),
         clipped_reward=float(round(clipped, 6)),
         satisfaction_proxy=float(round(y_t, 6)),
@@ -187,5 +299,11 @@ def compute_step_reward(
         "novelty_violation": v_nov,
         "satisfaction_proxy": y_t,
         "alignment": alignment,
+        "calibration_target": c_target,
+        "calibration_gap": c_gap,
+        "trust_bonus": trust_bonus,
+        "resource_pressure": res_pressure,
+        "risk_exposure": risk_value,
+        "diversity_pressure": div_pressure,
     }
     return clipped, breakdown, aux

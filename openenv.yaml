@@ -1,8 +1,14 @@
+spec_version: 1
 name: recommendation-policy-triage
+type: space
+runtime: fastapi
+app: server.app:app
+port: 7860
 version: "1.0.0"
 description: >
-  A structured OpenEnv benchmark for session-level recommendation policy under
-  memory uncertainty, repetition fatigue, novelty trade-offs, and live intent drift.
+  A structured OpenEnv benchmark for user experience, trust, and long-horizon
+  recommendation control under memory uncertainty, repetition fatigue, noisy
+  feedback, novelty trade-offs, resource constraints, and live intent drift.
 
 author: "Dibyajyoti001"
 tags:
@@ -38,6 +44,23 @@ tasks:
     description: >
       Historical memory and live session behavior diverge. The agent must detect intent drift,
       reduce reliance on stale memory, and recover relevance quickly.
+
+  - id: task_4
+    name: Echo Chamber Collapse
+    difficulty: hard
+    max_steps: 20
+    description: >
+      Strong early relevance hides a delayed collapse in trust and novelty tolerance.
+      The agent must diversify before slow-history pressure locks the session into an echo chamber
+      while staying within visible resource and safety constraints.
+
+  - id: task_5
+    name: Noisy Signal Calibration
+    difficulty: hard
+    max_steps: 20
+    description: >
+      Feedback is noisy and good-looking candidates can still disappoint. The agent must manage
+      confidence, trust, risk, and resource pressure under uncertainty.
 
 action_space:
   type: structured

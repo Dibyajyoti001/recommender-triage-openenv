@@ -106,6 +106,11 @@ def balanced_action(obs: Observation) -> Action:
         mem_bonus = 0.10 if item.category_id == top_memory_cat else 0.0
         live_bonus = 0.08 if (recent_majority is not None and item.category_id == recent_majority) else 0.0
         freshness_bonus = 0.05 if item.freshness == "fresh" else (0.04 if item.freshness == "novel" else -0.02)
+        trust_repair_bonus = 0.05 if obs.trust_signal < 0.55 and item.slot_type in {"balanced_bridge", "exploration_option"} else 0.0
+        volatility_pen = 0.08 if obs.feedback_volatility > 0.05 and item.slot_type == "live_best_fresh" else 0.0
+        budget_pen = 0.12 * item.cost / max(obs.budget_remaining, 0.10)
+        risk_pen = 0.14 * item.risk / max(obs.risk_tolerance, 0.10)
+        latency_pen = 0.10 * item.latency / max(obs.latency_budget, 0.10)
 
         score = (
             0.45 * item.quality
@@ -113,18 +118,33 @@ def balanced_action(obs: Observation) -> Action:
             + mem_bonus
             + live_bonus
             + freshness_bonus
+            + trust_repair_bonus
             - 0.20 * rep_pen
+            - volatility_pen
+            - budget_pen
+            - risk_pen
+            - latency_pen
         )
         if score > best_score:
             best_score = score
             best = item
 
     assert best is not None
-    explore = bool(obs.memory_confidence < 0.55 or obs.repetition_pressure_bucket == "high")
+    explore = bool(
+        obs.memory_confidence < 0.55
+        or obs.repetition_pressure_bucket == "high"
+        or obs.trust_signal < 0.50
+    )
+    confidence = 0.90 - 2.0 * obs.feedback_volatility
+    if explore:
+        confidence -= 0.12
+    if obs.trust_signal < 0.45:
+        confidence -= 0.08
+    confidence = max(0.20, min(0.92, confidence))
     return Action(
         recommended_item_id=best.item_id,
         exploration_flag=explore,
-        confidence_score=0.80 if not explore else 0.65,
+        confidence_score=confidence,
     )
 
 

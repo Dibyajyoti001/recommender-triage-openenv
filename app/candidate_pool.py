@@ -41,6 +41,15 @@ def _sample_quality(rng: np.random.Generator, lo: float, hi: float) -> float:
     return float(rng.uniform(lo, hi))
 
 
+def _sample_resource(
+    rng: np.random.Generator,
+    *,
+    center: float,
+    spread: float = 0.08,
+) -> float:
+    return float(_clip01(rng.normal(center, spread)))
+
+
 def _primary_category(topic_vector: Sequence[float]) -> int:
     return int(np.argmax(np.asarray(topic_vector, dtype=float)))
 
@@ -92,6 +101,9 @@ def _make_item(
     item_id: int,
     topic_vector: Sequence[float],
     quality: float,
+    cost: float,
+    risk: float,
+    latency: float,
     freshness: str,
     slot_type: str,
     rng: np.random.Generator,
@@ -108,6 +120,9 @@ def _make_item(
         category_name=category_name,
         quality=float(round(quality, 4)),
         engagement=float(round(engagement, 4)),
+        cost=float(round(cost, 4)),
+        risk=float(round(risk, 4)),
+        latency=float(round(latency, 4)),
         freshness=freshness,
         style_vector=_style_vec(rng),
         slot_type=slot_type,
@@ -129,6 +144,11 @@ def build_candidate_pool(
     rng: np.random.Generator,
     H_topic: Optional[Sequence[float]] = None,
     F_topic: Optional[Sequence[float]] = None,
+    trust_level: float = 0.72,
+    budget_remaining: float = 1.0,
+    risk_tolerance: float = 1.0,
+    latency_budget: float = 1.0,
+    diversity_collapsed: bool = False,
 ) -> List[CandidateItem]:
     cfg = get_task_config(task_id)
 
@@ -140,6 +160,11 @@ def build_candidate_pool(
     u_vec = _uniform(K)
     anti_m = _anti_distribution(m_vec)
     anti_z = _anti_distribution(z_vec)
+    trust = _clip01(trust_level)
+    trust_repair = max(0.0, 0.65 - trust)
+    budget_pressure = max(0.0, 0.60 - _clip01(budget_remaining))
+    latency_pressure = max(0.0, 0.60 - _clip01(latency_budget))
+    safety_pressure = max(0.0, 0.60 - _clip01(risk_tolerance))
 
     k_z = int(np.argmax(np.asarray(z_vec)))
     k_m = int(np.argmax(np.asarray(m_vec)))
@@ -147,8 +172,9 @@ def build_candidate_pool(
     least_recent_oh = [1.0 if i == least_recent else 0.0 for i in range(K)]
 
     balanced = _blend_sparse(
-        [(1.0 - cfg.omega_mix) * z_vec[i] for i in range(K)],
+        [(1.0 - cfg.omega_mix - 0.10 * trust_repair) * z_vec[i] for i in range(K)],
         [cfg.omega_mix * m_vec[i] for i in range(K)],
+        [0.10 * trust_repair * least_recent_oh[i] for i in range(K)],
     )
 
     fatigue_trap = _blend_sparse(
@@ -158,8 +184,8 @@ def build_candidate_pool(
     )
 
     exploration = _blend_sparse(
-        [0.45 * z_vec[i] for i in range(K)],
-        [0.35 * (1.0 - f_vec[i]) for i in range(K)],
+        [(0.45 + 0.10 * trust_repair) * z_vec[i] for i in range(K)],
+        [(0.35 - 0.10 * trust_repair) * (1.0 - f_vec[i]) for i in range(K)],
         [0.20 * least_recent_oh[i] for i in range(K)],
     )
 
@@ -177,7 +203,8 @@ def build_candidate_pool(
         )
 
     live_vec = _blend_sparse(
-        [0.70 * z_vec[i] for i in range(K)],
+        [(0.70 - 0.10 * trust_repair) * z_vec[i] for i in range(K)],
+        [0.10 * trust_repair * m_vec[i] for i in range(K)],
         [0.20 * least_recent_oh[i] for i in range(K)],
         [0.10 * u_vec[i] for i in range(K)],
     )
@@ -201,6 +228,30 @@ def build_candidate_pool(
             [0.10 * f_vec[i] for i in range(K)],
         )
 
+    if task_id == "task_4":
+        fatigue_trap = _blend_sparse(
+            [0.76 * z_vec[i] for i in range(K)],
+            [0.18 * h_vec[i] for i in range(K)],
+            [0.06 * f_vec[i] for i in range(K)],
+        )
+        exploration = _blend_sparse(
+            [0.35 * z_vec[i] for i in range(K)],
+            [0.35 * (1.0 - h_vec[i]) for i in range(K)],
+            [0.30 * least_recent_oh[i] for i in range(K)],
+        )
+
+    if diversity_collapsed:
+        live_vec = _blend_sparse(
+            [0.45 * z_vec[i] for i in range(K)],
+            [0.30 * (1.0 - h_vec[i]) for i in range(K)],
+            [0.25 * least_recent_oh[i] for i in range(K)],
+        )
+        mem_vec = _blend_sparse(
+            [0.46 * m_vec[i] for i in range(K)],
+            [0.28 * least_recent_oh[i] for i in range(K)],
+            [0.26 * u_vec[i] for i in range(K)],
+        )
+
     next_id_base = turn * 10_000 + 100
     items: List[CandidateItem] = []
 
@@ -217,12 +268,46 @@ def build_candidate_pool(
         topic_vec_sparse = _to_sparse(topic_vec, max_topics=3, min_keep=0.10)
         fatigue_hint = float(sum(float(a) * float(b) for a, b in zip(f_vec, topic_vec_sparse)))
         repetition_hint = float(sum(float(a) * float(b) for a, b in zip(h_vec, topic_vec_sparse)))
+        resource_profiles = {
+            "live_best_fresh": (0.70, 0.55, 0.58),
+            "memory_best_fresh": (0.44, 0.22, 0.28),
+            "balanced_bridge": (0.52, 0.30, 0.40),
+            "fatigue_trap": (0.60, 0.68, 0.34),
+            "exploration_option": (0.40, 0.62, 0.55),
+            "conflict_option": (0.35, 0.52, 0.46),
+        }
+        base_cost, base_risk, base_latency = resource_profiles[slot_type]
+
+        if freshness == "novel":
+            base_risk += 0.06
+            base_latency += 0.05
+        elif freshness == "stale":
+            base_risk += 0.04
+            base_latency -= 0.04
+
+        if slot_type == "live_best_fresh":
+            base_cost += 0.08 * budget_pressure
+            base_risk += 0.06 * safety_pressure
+        if slot_type == "exploration_option":
+            base_risk += 0.08 * safety_pressure
+        if slot_type == "fatigue_trap":
+            base_risk += 0.08 * trust_repair
+        if diversity_collapsed and slot_type in {"live_best_fresh", "memory_best_fresh"}:
+            base_risk += 0.06
+            base_cost += 0.05
+
+        cost = _sample_resource(rng, center=base_cost, spread=0.07)
+        risk = _sample_resource(rng, center=base_risk, spread=0.07)
+        latency = _sample_resource(rng, center=base_latency + 0.06 * latency_pressure, spread=0.06)
 
         items.append(
             _make_item(
                 item_id=next_id_base + idx,
                 topic_vector=topic_vec_sparse,
                 quality=quality,
+                cost=cost,
+                risk=risk,
+                latency=latency,
                 freshness=freshness,
                 slot_type=slot_type,
                 rng=rng,
@@ -234,6 +319,9 @@ def build_candidate_pool(
                     "live_category": k_z,
                     "memory_category": k_m,
                     "topic_order": CATEGORY_NAMES,
+                    "cost_hint": float(round(cost, 4)),
+                    "risk_hint": float(round(risk, 4)),
+                    "latency_hint": float(round(latency, 4)),
                 },
             )
         )

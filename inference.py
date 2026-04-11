@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -22,6 +23,7 @@ SESSION_ID = os.getenv("SESSION_ID", "default")
 
 MAX_STEPS = 20
 TIMEOUT = 60.0
+DEFAULT_TASK_IDS = ("task_1", "task_2", "task_3", "task_4", "task_5")
 
 SYSTEM_PROMPT = """
 You control a recommendation-policy environment.
@@ -42,6 +44,9 @@ Guidelines:
 - Use memory summary when memory confidence is strong.
 - Avoid excessive repetition when repetition pressure is high.
 - In conflict cases, recent interaction signals may override stale memory.
+- Lower confidence when feedback volatility is high or trust is weak.
+- Respect visible budget, risk, and latency constraints when choosing items.
+- Protect long-term trust and engagement, not just short-term fit.
 - Output JSON only, with no extra text.
 """.strip()
 
@@ -64,7 +69,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, rewards: List[float], score: float) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
@@ -94,6 +99,9 @@ def fallback_action(obs: Dict[str, Any]) -> Dict[str, Any]:
         cat = int(item.get("category_id", 0))
         quality = float(item.get("quality", 0.0))
         engagement = float(item.get("engagement", 0.0))
+        cost = float(item.get("cost", 0.0))
+        risk = float(item.get("risk", 0.0))
+        latency = float(item.get("latency", 0.0))
         freshness = item.get("freshness", "fresh")
 
         score = 0.60 * quality + 0.20 * engagement
@@ -111,6 +119,10 @@ def fallback_action(obs: Dict[str, Any]) -> Dict[str, Any]:
         elif freshness == "stale":
             score -= 0.02
 
+        score -= 0.12 * cost / max(float(obs.get("budget_remaining", 1.0)), 0.10)
+        score -= 0.14 * risk / max(float(obs.get("risk_tolerance", 1.0)), 0.10)
+        score -= 0.10 * latency / max(float(obs.get("latency_budget", 1.0)), 0.10)
+
         if score > best_score:
             best_score = score
             best = item
@@ -119,12 +131,20 @@ def fallback_action(obs: Dict[str, Any]) -> Dict[str, Any]:
         obs.get("memory_confidence", 0.0) < 0.55
         or obs.get("repetition_pressure_bucket") == "high"
         or best.get("freshness") == "novel"
+        or obs.get("trust_signal", 1.0) < 0.50
     )
+
+    confidence = 0.88 - 2.0 * float(obs.get("feedback_volatility", 0.0))
+    if explore:
+        confidence -= 0.12
+    if float(obs.get("trust_signal", 1.0)) < 0.45:
+        confidence -= 0.08
+    confidence = max(0.20, min(0.92, confidence))
 
     return {
         "recommended_item_id": int(best["item_id"]),
         "exploration_flag": explore,
-        "confidence_score": 0.80 if not explore else 0.65,
+        "confidence_score": confidence,
     }
 
 
@@ -141,6 +161,13 @@ def build_user_prompt(obs: Dict[str, Any]) -> str:
         "memory_confidence_bucket": obs.get("memory_confidence_bucket"),
         "memory_confidence": obs.get("memory_confidence"),
         "session_feedback_signal": obs.get("session_feedback_signal"),
+        "feedback_volatility": obs.get("feedback_volatility"),
+        "trust_signal": obs.get("trust_signal"),
+        "engagement_signal": obs.get("engagement_signal"),
+        "budget_remaining": obs.get("budget_remaining"),
+        "risk_tolerance": obs.get("risk_tolerance"),
+        "latency_budget": obs.get("latency_budget"),
+        "engagement_bucket": obs.get("engagement_bucket"),
         "candidate_items": [
             {
                 "item_id": c.get("item_id"),
@@ -148,6 +175,9 @@ def build_user_prompt(obs: Dict[str, Any]) -> str:
                 "category_name": c.get("category_name"),
                 "quality": c.get("quality"),
                 "engagement": c.get("engagement"),
+                "cost": c.get("cost"),
+                "risk": c.get("risk"),
+                "latency": c.get("latency"),
                 "freshness": c.get("freshness"),
                 "slot_type": c.get("slot_type"),
             }
@@ -189,31 +219,65 @@ def action_to_log_string(action: Dict[str, Any]) -> str:
     return json.dumps(action, separators=(",", ":"), ensure_ascii=False)
 
 
-def run_task(task_id: str, client: OpenAI, http: httpx.Client) -> Dict[str, Any]:
-    obs = http.post(
-        f"{ENV_BASE_URL}/reset",
-        params={"task_id": task_id, "session_id": SESSION_ID},
-    ).json()
+def reset_with_retry(http: httpx.Client, task_id: str) -> Dict[str, Any]:
+    last_error: Optional[Exception] = None
 
+    for attempt in range(1, 11):
+        try:
+            response = http.post(
+                f"{ENV_BASE_URL}/reset",
+                params={"task_id": task_id, "session_id": SESSION_ID},
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt == 10:
+                break
+            time.sleep(min(2**attempt, 20))
+
+    raise RuntimeError(f"Failed to reset environment for {task_id}") from last_error
+
+
+def fetch_task_ids(http: httpx.Client) -> List[str]:
+    try:
+        response = http.get(f"{ENV_BASE_URL}/tasks")
+        response.raise_for_status()
+        payload = response.json()
+        tasks = payload.get("tasks", [])
+        task_ids = [str(task["task_id"]) for task in tasks if "task_id" in task]
+        if task_ids:
+            return task_ids
+    except Exception:
+        pass
+    return list(DEFAULT_TASK_IDS)
+
+
+def run_task(task_id: str, client: OpenAI, http: httpx.Client) -> Dict[str, Any]:
     done = False
     step_count = 0
     rewards: List[float] = []
     last_info: Dict[str, Any] = {}
     success = False
     score = 0.0
+    obs: Dict[str, Any] = {}
 
-    log_start(task=obs.get("task_name", task_id), env=BENCHMARK, model=MODEL_NAME or "")
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME or "")
 
     try:
+        obs = reset_with_retry(http, task_id)
+
         while not done and step_count < MAX_STEPS:
             action = llm_action(client, obs)
 
             try:
-                data = http.post(
+                response = http.post(
                     f"{ENV_BASE_URL}/step",
                     params={"session_id": SESSION_ID},
                     json=action,
-                ).json()
+                )
+                response.raise_for_status()
+                data = response.json()
 
                 obs = data["observation"]
                 done = bool(data["done"])
@@ -231,10 +295,12 @@ def run_task(task_id: str, client: OpenAI, http: httpx.Client) -> Dict[str, Any]
             log_step(step_count, action_to_log_string(action), reward, done, error_msg)
 
         try:
-            score_payload = http.get(
+            response = http.get(
                 f"{ENV_BASE_URL}/grader",
                 params={"session_id": SESSION_ID},
-            ).json()
+            )
+            response.raise_for_status()
+            score_payload = response.json()
         except Exception:
             score_payload = last_info.get("final_grade", {})
 
@@ -250,7 +316,7 @@ def run_task(task_id: str, client: OpenAI, http: httpx.Client) -> Dict[str, Any]
         }
 
     finally:
-        log_end(success, step_count, rewards, score)
+        log_end(success, step_count, score, rewards)
 
 
 def main() -> None:
@@ -259,7 +325,7 @@ def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     with httpx.Client(timeout=TIMEOUT) as http:
-        for task_id in ["task_1", "task_2", "task_3"]:
+        for task_id in fetch_task_ids(http):
             run_task(task_id, client, http)
 
 

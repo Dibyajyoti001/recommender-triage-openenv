@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from math import exp, log
 from typing import List, Optional, Sequence, Tuple
 
-from .models import FinalGradeBreakdown
+from .models import CounterfactualAuditResult, FinalGradeBreakdown
 from .tasks import K, GLOBAL, TaskConfig, get_task_config
 
 
@@ -37,8 +37,27 @@ class TrajectoryStep:
     z: List[float]
     p_before: float
     p_after: float
-    exploration_flag: bool
-    confidence_score: float
+    trust_before: float = 0.7
+    trust_after: float = 0.7
+    observed_feedback: float = 0.5
+    feedback_volatility: float = 0.0
+    repetition_pressure: float = 0.0
+    novelty_violation: float = 0.0
+    resource_pressure: float = 0.0
+    risk_exposure: float = 0.0
+    diversity_pressure: float = 0.0
+    platform_gain: float = 0.0
+    budget_remaining: float = 1.0
+    risk_tolerance: float = 1.0
+    latency_budget: float = 1.0
+    calibration_target: float = 1.0
+    slot_type: str = "live_best_fresh"
+    saturated: bool = False
+    trust_collapsed: bool = False
+    risk_collapsed: bool = False
+    diversity_collapsed: bool = False
+    exploration_flag: bool = False
+    confidence_score: float = 0.8
 
 
 def satisfaction_grade(traj: Sequence[TrajectoryStep]) -> float:
@@ -148,6 +167,9 @@ def adaptation_grade(
     theta_rec: float,
     lambda_A: float,
 ) -> Tuple[float, Optional[int], Optional[int]]:
+    if task_id == "task_4":
+        return echo_chamber_adaptation_grade(traj)
+
     drift_turn = detect_drift_turn(traj, task_id=task_id, tau=tau)
 
     # For non-drift tasks, no drift is fine.
@@ -202,7 +224,137 @@ def memory_use_grade(traj: Sequence[TrajectoryStep]) -> float:
     return _clip01(matches / len(traj))
 
 
-def final_grade(traj: Sequence[TrajectoryStep], task_id: str) -> FinalGradeBreakdown:
+def trust_grade(traj: Sequence[TrajectoryStep]) -> float:
+    if not traj:
+        return 0.0
+    mean_trust = sum(step.trust_after for step in traj) / len(traj)
+    terminal_trust = traj[-1].trust_after
+    return _clip01(0.60 * mean_trust + 0.40 * terminal_trust)
+
+
+def calibration_grade(traj: Sequence[TrajectoryStep]) -> float:
+    if not traj:
+        return 0.0
+    scores = [
+        exp(-abs(step.confidence_score - step.calibration_target))
+        for step in traj
+    ]
+    return _clip01(sum(scores) / len(scores))
+
+
+def risk_safety_grade(traj: Sequence[TrajectoryStep]) -> float:
+    if not traj:
+        return 0.0
+    mean_risk = sum(step.risk_exposure for step in traj) / len(traj)
+    return _clip01(1.0 - mean_risk)
+
+
+def resource_efficiency_grade(traj: Sequence[TrajectoryStep]) -> float:
+    if not traj:
+        return 0.0
+    mean_pressure = sum(step.resource_pressure for step in traj) / len(traj)
+    return _clip01(1.0 - mean_pressure)
+
+
+def collapse_gate(traj: Sequence[TrajectoryStep]) -> float:
+    gate = 1.0
+    if any(step.trust_collapsed for step in traj):
+        gate *= 0.45
+    if any(step.risk_collapsed for step in traj):
+        gate *= 0.55
+    if any(step.diversity_collapsed for step in traj):
+        gate *= 0.60
+    return _clip01(gate)
+
+
+def floor_gate(trust_score: float, risk_safe_score: float, diversity_score: float) -> float:
+    gate = min(
+        1.0,
+        trust_score / 0.35 if trust_score > 0.0 else 0.0,
+        risk_safe_score / 0.35 if risk_safe_score > 0.0 else 0.0,
+        diversity_score / 0.30 if diversity_score > 0.0 else 0.0,
+    )
+    return _clip01(max(0.20, gate))
+
+
+def counterfactual_audit_grade(
+    audits: Sequence[CounterfactualAuditResult] | None,
+) -> Tuple[float, int]:
+    if not audits:
+        return 0.0, 0
+    score = sum(audit.audit_score for audit in audits) / len(audits)
+    return _clip01(score), len(audits)
+
+
+def echo_chamber_adaptation_grade(
+    traj: Sequence[TrajectoryStep],
+) -> Tuple[float, Optional[int], Optional[int]]:
+    if not traj:
+        return 0.0, None, None
+
+    onset = next((idx for idx, step in enumerate(traj) if step.saturated), None)
+    if onset is None:
+        if len(traj) <= 1:
+            return _clip01(trust_grade(traj)), None, None
+
+        switches = sum(
+            1
+            for i in range(1, len(traj))
+            if traj[i].chosen_category_id != traj[i - 1].chosen_category_id
+        )
+        switch_rate = switches / (len(traj) - 1)
+        exploratory_rate = sum(
+            1
+            for step in traj
+            if step.exploration_flag or step.slot_type == "exploration_option"
+        ) / len(traj)
+        prevention_score = (
+            0.45 * trust_grade(traj)
+            + 0.30 * switch_rate
+            + 0.25 * exploratory_rate
+        )
+        return _clip01(prevention_score), None, None
+
+    recovery = None
+    for idx in range(onset + 2, len(traj)):
+        trust_avg = sum(traj[j].trust_after for j in range(idx - 1, idx + 1)) / 2.0
+        nov_avg = sum(traj[j].novelty_violation for j in range(idx - 1, idx + 1)) / 2.0
+        if trust_avg >= 0.62 and nov_avg <= 0.05:
+            recovery = idx
+            break
+
+    pre_window = traj[max(0, onset - 4) : onset + 1]
+    if len(pre_window) <= 1:
+        switch_rate = 0.0
+    else:
+        switches = sum(
+            1
+            for i in range(1, len(pre_window))
+            if pre_window[i].chosen_category_id != pre_window[i - 1].chosen_category_id
+        )
+        switch_rate = switches / (len(pre_window) - 1)
+
+    exploratory_rate = sum(
+        1
+        for step in pre_window
+        if step.exploration_flag or step.slot_type == "exploration_option"
+    ) / max(1, len(pre_window))
+
+    if recovery is None:
+        stability = sum(step.trust_after for step in traj[onset:]) / max(1, len(traj) - onset)
+        score = 0.45 * switch_rate + 0.25 * exploratory_rate + 0.30 * stability
+        return _clip01(score), onset, None
+
+    delay_score = exp(-0.40 * (recovery - onset))
+    score = 0.25 * switch_rate + 0.20 * exploratory_rate + 0.55 * delay_score
+    return _clip01(score), onset, recovery
+
+
+def final_grade(
+    traj: Sequence[TrajectoryStep],
+    task_id: str,
+    audits: Sequence[CounterfactualAuditResult] | None = None,
+) -> FinalGradeBreakdown:
     cfg: TaskConfig = get_task_config(task_id)
 
     s = satisfaction_grade(traj)
@@ -215,20 +367,58 @@ def final_grade(traj: Sequence[TrajectoryStep], task_id: str) -> FinalGradeBreak
         lambda_A=GLOBAL.lambda_A,
     )
     m = memory_use_grade(traj)
+    t = trust_grade(traj)
+    c = calibration_grade(traj)
+    r = risk_safety_grade(traj)
+    e = resource_efficiency_grade(traj)
+    audit_score, audit_count = counterfactual_audit_grade(audits)
 
-    final = (
-        cfg.omega_1 * s
-        + cfg.omega_2 * d
-        + cfg.omega_3 * a
-        + cfg.omega_4 * m
-    )
-    final = _clip01(final)
+    if task_id == "task_4":
+        base = 0.30 * s + 0.25 * t + 0.20 * r + 0.25 * d
+        gate = collapse_gate(traj)
+        floor = floor_gate(t, r, d)
+        final = _clip01(base * gate * floor)
+        if audit_count > 0 and cfg.counterfactual_audit_weight > 0.0:
+            final = _clip01(
+                (1.0 - cfg.counterfactual_audit_weight) * final
+                + cfg.counterfactual_audit_weight * audit_score
+            )
+    elif task_id == "task_5":
+        base = 0.25 * s + 0.20 * t + 0.20 * r + 0.10 * d + 0.25 * c
+        gate = collapse_gate(traj)
+        floor = floor_gate(t, r, max(d, 0.30 * c))
+        final = _clip01(base * gate * floor)
+        if audit_count > 0 and cfg.counterfactual_audit_weight > 0.0:
+            final = _clip01(
+                (1.0 - cfg.counterfactual_audit_weight) * final
+                + cfg.counterfactual_audit_weight * audit_score
+            )
+    else:
+        gate = 1.0
+        floor = 1.0
+        final = (
+            cfg.omega_1 * s
+            + cfg.omega_2 * d
+            + cfg.omega_3 * a
+            + cfg.omega_4 * m
+            + cfg.omega_trust * t
+            + cfg.omega_calibration * c
+        )
+        final = _clip01(final)
 
     return FinalGradeBreakdown(
         satisfaction=float(round(s, 6)),
         diversity=float(round(d, 6)),
         adaptation=float(round(a, 6)),
         memory_use=float(round(m, 6)),
+        trust=float(round(t, 6)),
+        calibration=float(round(c, 6)),
+        risk_safety=float(round(r, 6)),
+        resource_efficiency=float(round(e, 6)),
+        counterfactual_audit=float(round(audit_score, 6)),
+        audited_turns=audit_count,
+        collapse_gate=float(round(gate, 6)),
+        floor_gate=float(round(floor, 6)),
         final_score=float(round(final, 6)),
         drift_turn=drift_turn,
         recovered_turn=recovery_turn,
@@ -237,5 +427,7 @@ def final_grade(traj: Sequence[TrajectoryStep], task_id: str) -> FinalGradeBreak
             "diversity": cfg.omega_2,
             "adaptation": cfg.omega_3,
             "memory_use": cfg.omega_4,
+            "trust": cfg.omega_trust,
+            "calibration": cfg.omega_calibration,
         },
     )

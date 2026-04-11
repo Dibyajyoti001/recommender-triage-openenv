@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import time
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from .graders import FinalGradeBreakdown
-from .models import Action, EnvironmentState, GraderResponse, Observation, StepResult, TaskListResponse
+from .models import Action, EnvironmentState, FinalGradeBreakdown, GraderResponse, Observation, StepResult, TaskListResponse
 from .simulator import RecommendationPolicyEnvironment
 from .tasks import list_task_specs
 
@@ -16,8 +15,8 @@ app = FastAPI(
     title="Recommendation Policy Triage Environment",
     version="1.0.0",
     description=(
-        "A complete OpenEnv-style environment for sequential recommendation policy "
-        "under memory uncertainty, repetition fatigue, and intent drift."
+        "A complete OpenEnv-style environment for trust-aware recommendation control "
+        "under memory uncertainty, repetition fatigue, noisy feedback, and intent drift."
     ),
 )
 
@@ -28,6 +27,32 @@ _DEFAULT_SESSION_ID = "default"
 class BaselineResponse(BaseModel):
     task_scores: Dict[str, float]
     average_score: float
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+class MetadataResponse(BaseModel):
+    name: str
+    description: str
+    version: str
+
+
+class SchemaResponse(BaseModel):
+    action: Dict[str, Any]
+    observation: Dict[str, Any]
+    state: Dict[str, Any]
+
+
+class MCPResponse(BaseModel):
+    jsonrpc: str
+    id: Any = None
+    error: Dict[str, Any]
+
+
+def _task_ids() -> List[str]:
+    return [spec.task_id for spec in list_task_specs()]
 
 
 def _get_env(session_id: str = _DEFAULT_SESSION_ID) -> RecommendationPolicyEnvironment:
@@ -61,6 +86,11 @@ def _balanced_heuristic_action(obs: Observation) -> Action:
         memory_bonus = 0.12 if item.category_id == top_memory_cat else 0.0
         freshness_bonus = 0.06 if item.freshness == "fresh" else (0.08 if item.freshness == "novel" else -0.02)
         anti_repeat_bonus = 0.05 if recent_majority is not None and item.category_id != recent_majority else 0.0
+        trust_repair_bonus = 0.05 if obs.trust_signal < 0.55 and item.slot_type in {"balanced_bridge", "exploration_option"} else 0.0
+        volatility_pen = 0.08 if obs.feedback_volatility > 0.05 and item.slot_type == "live_best_fresh" else 0.0
+        budget_pen = 0.12 * item.cost / max(obs.budget_remaining, 0.10)
+        risk_pen = 0.14 * item.risk / max(obs.risk_tolerance, 0.10)
+        latency_pen = 0.10 * item.latency / max(obs.latency_budget, 0.10)
 
         score = (
             0.55 * item.quality
@@ -68,7 +98,12 @@ def _balanced_heuristic_action(obs: Observation) -> Action:
             + memory_bonus
             + freshness_bonus
             + anti_repeat_bonus
+            + trust_repair_bonus
             - repetition_pen
+            - volatility_pen
+            - budget_pen
+            - risk_pen
+            - latency_pen
         )
 
         if score > best_score:
@@ -79,8 +114,14 @@ def _balanced_heuristic_action(obs: Observation) -> Action:
         obs.memory_confidence < 0.55
         or obs.repetition_pressure_bucket == "high"
         or best_item.freshness == "novel"
+        or obs.trust_signal < 0.50
     )
-    confidence = 0.80 if not explore else 0.65
+    confidence = 0.90 - 2.0 * obs.feedback_volatility
+    if explore:
+        confidence -= 0.12
+    if obs.trust_signal < 0.45:
+        confidence -= 0.08
+    confidence = max(0.20, min(0.92, confidence))
     return Action(
         recommended_item_id=best_item.item_id,
         exploration_flag=explore,
@@ -94,6 +135,42 @@ def root() -> Dict[str, str]:
         "status": "ok",
         "message": "Recommendation Policy Triage Environment is running.",
     }
+
+
+@app.get("/health", response_model=HealthResponse)
+def health_endpoint() -> HealthResponse:
+    return HealthResponse(status="healthy")
+
+
+@app.get("/metadata", response_model=MetadataResponse)
+def metadata_endpoint() -> MetadataResponse:
+    return MetadataResponse(
+        name=app.title,
+        description=app.description or "",
+        version=app.version,
+    )
+
+
+@app.get("/schema", response_model=SchemaResponse)
+def schema_endpoint() -> SchemaResponse:
+    return SchemaResponse(
+        action=Action.model_json_schema(),
+        observation=Observation.model_json_schema(),
+        state=EnvironmentState.model_json_schema(),
+    )
+
+
+@app.post("/mcp", response_model=MCPResponse)
+def mcp_endpoint(payload: Optional[Dict[str, Any]] = None) -> MCPResponse:
+    request_id = None if payload is None else payload.get("id")
+    return MCPResponse(
+        jsonrpc="2.0",
+        id=request_id,
+        error={
+            "code": -32601,
+            "message": "MCP methods are not implemented on this benchmark server.",
+        },
+    )
 
 
 @app.get("/tasks", response_model=TaskListResponse)
@@ -148,7 +225,7 @@ def baseline_endpoint(num_runs: int = Query(default=3, ge=1, le=20)) -> Baseline
     """
     task_scores: Dict[str, float] = {}
 
-    for task_id in ["task_1", "task_2", "task_3"]:
+    for task_id in _task_ids():
         scores: List[float] = []
         for run_idx in range(num_runs):
             env = RecommendationPolicyEnvironment(seed=10_000 + run_idx)
@@ -168,4 +245,3 @@ def baseline_endpoint(num_runs: int = Query(default=3, ge=1, le=20)) -> Baseline
 
     average_score = round(sum(task_scores.values()) / len(task_scores), 6)
     return BaselineResponse(task_scores=task_scores, average_score=average_score)
-

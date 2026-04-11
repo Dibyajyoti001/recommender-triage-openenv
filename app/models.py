@@ -21,6 +21,7 @@ FeedbackBucket = Literal["low", "neutral", "positive", "strong_positive"]
 PressureBucket = Literal["low", "medium", "high"]
 ConfidenceBucket = Literal["weak", "moderate", "strong"]
 FreshnessBucket = Literal["fresh", "stale", "novel"]
+EngagementBucket = Literal["fragile", "stable", "engaged"]
 
 
 class CandidateItem(BaseModel):
@@ -38,6 +39,9 @@ class CandidateItem(BaseModel):
     category_name: CategoryName
     quality: float = Field(ge=0.0, le=1.0)
     engagement: float = Field(ge=0.0, le=1.0)
+    cost: float = Field(ge=0.0, le=1.0, default=0.0)
+    risk: float = Field(ge=0.0, le=1.0, default=0.0)
+    latency: float = Field(ge=0.0, le=1.0, default=0.0)
     freshness: FreshnessBucket
     style_vector: List[float]
     slot_type: str
@@ -77,6 +81,13 @@ class Observation(BaseModel):
     memory_confidence_bucket: ConfidenceBucket
     memory_confidence: float = Field(ge=0.0, le=1.0)
     session_feedback_signal: float = Field(ge=0.0, le=1.0)
+    feedback_volatility: float = Field(ge=0.0, le=1.0, default=0.0)
+    trust_signal: float = Field(ge=0.0, le=1.0, default=0.0)
+    engagement_signal: float = Field(ge=0.0, le=1.0, default=0.0)
+    budget_remaining: float = Field(ge=0.0, le=1.0, default=1.0)
+    risk_tolerance: float = Field(ge=0.0, le=1.0, default=1.0)
+    latency_budget: float = Field(ge=0.0, le=1.0, default=1.0)
+    engagement_bucket: EngagementBucket = "stable"
     done_hint: str = ""
 
 
@@ -97,6 +108,13 @@ class RewardBreakdown(BaseModel):
     novelty_violation: float
     unnecessary_exploration: float
     confidence_penalty: float
+    trust_bonus: float = 0.0
+    calibration_target: float = 1.0
+    calibration_gap: float = 0.0
+    resource_pressure: float = 0.0
+    risk_exposure: float = 0.0
+    diversity_pressure: float = 0.0
+    platform_gain: float = 0.0
     raw_reward: float
     clipped_reward: float
     satisfaction_proxy: float
@@ -135,7 +153,34 @@ class HiddenState(BaseModel):
     drift_turn: Optional[int] = None
     recovered_turn: Optional[int] = None
     last_feedback_bucket: FeedbackBucket = "neutral"
+    trust: float = 0.0
+    budget_remaining: float = 1.0
+    risk_tolerance: float = 1.0
+    latency_budget: float = 1.0
+    feedback_history: List[float] = Field(default_factory=list)
+    risk_history: List[float] = Field(default_factory=list)
+    diversity_history: List[float] = Field(default_factory=list)
+    saturation_turn: Optional[int] = None
+    trust_collapsed: bool = False
+    risk_collapsed: bool = False
+    diversity_collapsed: bool = False
+    risk_noise_floor: float = 0.0
+    volatility_floor: float = 0.0
     rng_seed: int = 0
+
+
+class CounterfactualAuditResult(BaseModel):
+    turn_id: int
+    fragility: float = Field(ge=0.0, le=1.0)
+    chosen_value: float = Field(ge=0.0, le=1.0)
+    safe_value: float = Field(ge=0.0, le=1.0)
+    risky_value: float = Field(ge=0.0, le=1.0)
+    safe_advantage: float
+    risky_advantage: float
+    audit_score: float = Field(ge=0.0, le=1.0)
+    chosen_slot_type: str = ""
+    safe_slot_type: str = ""
+    risky_slot_type: str = ""
 
 
 class FinalGradeBreakdown(BaseModel):
@@ -143,6 +188,14 @@ class FinalGradeBreakdown(BaseModel):
     diversity: float = Field(ge=0.0, le=1.0)
     adaptation: float = Field(ge=0.0, le=1.0)
     memory_use: float = Field(ge=0.0, le=1.0)
+    trust: float = Field(ge=0.0, le=1.0, default=0.0)
+    calibration: float = Field(ge=0.0, le=1.0, default=0.0)
+    risk_safety: float = Field(ge=0.0, le=1.0, default=0.0)
+    resource_efficiency: float = Field(ge=0.0, le=1.0, default=0.0)
+    counterfactual_audit: float = Field(ge=0.0, le=1.0, default=0.0)
+    audited_turns: int = Field(ge=0, default=0)
+    collapse_gate: float = Field(ge=0.0, le=1.0, default=1.0)
+    floor_gate: float = Field(ge=0.0, le=1.0, default=1.0)
     final_score: float = Field(ge=0.0, le=1.0)
     drift_turn: Optional[int] = None
     recovered_turn: Optional[int] = None
@@ -177,3 +230,4 @@ class EnvironmentState(BaseModel):
     task_spec: TaskSpec
     trajectory_length: int
     latest_reward_breakdown: Optional[RewardBreakdown] = None
+    audit_results: List[CounterfactualAuditResult] = Field(default_factory=list)

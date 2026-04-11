@@ -46,6 +46,9 @@ def test_candidate_pool_has_exact_six_slots():
         assert _is_prob_vector(item.topic_vector)
         assert 0.0 <= item.quality <= 1.0
         assert 0.0 <= item.engagement <= 1.0
+        assert 0.0 <= item.cost <= 1.0
+        assert 0.0 <= item.risk <= 1.0
+        assert 0.0 <= item.latency <= 1.0
         assert item.freshness in {"fresh", "stale", "novel"}
 
 
