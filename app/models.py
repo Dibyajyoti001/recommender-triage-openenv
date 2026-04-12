@@ -167,6 +167,8 @@ class HiddenState(BaseModel):
     risk_noise_floor: float = 0.0
     volatility_floor: float = 0.0
     rng_seed: int = 0
+    regime: int = Field(default=0, ge=0, le=3)
+    latent_vol: float = Field(default=0.15, ge=0.0, le=1.0)
 
 
 class CounterfactualAuditResult(BaseModel):

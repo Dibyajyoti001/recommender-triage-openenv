@@ -91,3 +91,42 @@ def test_task3_conflict_option_points_away_from_memory():
     # all items remain valid sparse-ish distributions
     for item in items:
         assert _is_prob_vector(item.topic_vector)
+
+
+def test_distressed_regime_opens_safer_recovery_lanes():
+    z = [0.02, 0.03, 0.04, 0.04, 0.03, 0.08, 0.04, 0.07, 0.58, 0.07]
+    m = [0.02, 0.03, 0.04, 0.05, 0.03, 0.10, 0.05, 0.06, 0.55, 0.07]
+
+    stable_items = build_candidate_pool(
+        task_id="task_4",
+        turn=10,
+        alpha=0.52,
+        eta_q=0.25,
+        z=z,
+        m=m,
+        item_fatigue={},
+        history_categories=[8, 8, 8, 5],
+        rng=np.random.default_rng(999),
+        regime=0,
+        latent_vol=0.12,
+    )
+    distressed_items = build_candidate_pool(
+        task_id="task_4",
+        turn=10,
+        alpha=0.52,
+        eta_q=0.25,
+        z=z,
+        m=m,
+        item_fatigue={},
+        history_categories=[8, 8, 8, 5],
+        rng=np.random.default_rng(999),
+        regime=3,
+        latent_vol=0.70,
+    )
+
+    stable_by_slot = {item.slot_type: item for item in stable_items}
+    distressed_by_slot = {item.slot_type: item for item in distressed_items}
+
+    assert distressed_by_slot["exploration_option"].risk < stable_by_slot["exploration_option"].risk
+    assert distressed_by_slot["balanced_bridge"].cost < stable_by_slot["balanced_bridge"].cost
+    assert distressed_by_slot["fatigue_trap"].risk > stable_by_slot["fatigue_trap"].risk

@@ -56,6 +56,8 @@ class TrajectoryStep:
     trust_collapsed: bool = False
     risk_collapsed: bool = False
     diversity_collapsed: bool = False
+    regime: int = 0
+    latent_vol: float = 0.15
     exploration_flag: bool = False
     confidence_score: float = 0.8
 

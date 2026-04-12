@@ -59,3 +59,30 @@ def test_reset_step_state_smoke():
 
     state = client.get("/state")
     assert state.status_code == 200
+
+
+def test_visualize_endpoint_returns_regime_series():
+    reset = client.post("/reset", params={"task_id": "task_4", "session_id": "viz"})
+    assert reset.status_code == 200
+    obs = reset.json()
+
+    for _ in range(3):
+        first_item = obs["candidate_items"][0]["item_id"]
+        step = client.post(
+            "/step",
+            params={"session_id": "viz"},
+            json={
+                "recommended_item_id": first_item,
+                "exploration_flag": False,
+                "confidence_score": 0.8,
+            },
+        )
+        assert step.status_code == 200
+        obs = step.json()["observation"]
+
+    viz = client.get("/visualize", params={"session_id": "viz"})
+    assert viz.status_code == 200
+    payload = viz.json()
+    assert payload["task_id"] == "task_4"
+    assert len(payload["turns"]) == len(payload["regimes"]) == len(payload["latent_vol"])
+    assert payload["regime_labels"]

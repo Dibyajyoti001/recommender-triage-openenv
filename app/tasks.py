@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List
+
+import numpy as np
 
 from .models import TaskSpec
 
@@ -128,6 +130,14 @@ class TaskConfig:
     counterfactual_audit_horizon: int = 4
     counterfactual_audit_budget: int = 0
     counterfactual_fragility_threshold: float = 1.0
+    regime_init: int = 0
+    regime_sticky: float = 0.85
+    latent_vol_init: float = 0.15
+    latent_vol_revert: float = 0.92
+    regime_drift_multiplier: List[float] = field(default_factory=lambda: [0.90, 1.10, 1.00, 1.25])
+    regime_noise_multiplier: List[float] = field(default_factory=lambda: [0.65, 0.95, 1.05, 1.30])
+    regime_fatigue_multiplier: List[float] = field(default_factory=lambda: [0.95, 1.05, 1.30, 1.15])
+    regime_trust_loss_multiplier: List[float] = field(default_factory=lambda: [0.90, 1.00, 1.15, 1.35])
 
     def to_spec(self) -> TaskSpec:
         params = {
@@ -181,6 +191,14 @@ class TaskConfig:
             "counterfactual_audit_horizon": self.counterfactual_audit_horizon,
             "counterfactual_audit_budget": self.counterfactual_audit_budget,
             "counterfactual_fragility_threshold": self.counterfactual_fragility_threshold,
+            "regime_init": self.regime_init,
+            "regime_sticky": self.regime_sticky,
+            "latent_vol_init": self.latent_vol_init,
+            "latent_vol_revert": self.latent_vol_revert,
+            "regime_drift_multiplier": self.regime_drift_multiplier,
+            "regime_noise_multiplier": self.regime_noise_multiplier,
+            "regime_fatigue_multiplier": self.regime_fatigue_multiplier,
+            "regime_trust_loss_multiplier": self.regime_trust_loss_multiplier,
             "topic_names": CATEGORY_NAMES,
         }
         return TaskSpec(
@@ -249,6 +267,14 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         risk_tolerance_recovery=0.07,
         risk_tolerance_decay=0.08,
         resource_pressure_loss=0.02,
+        regime_init=0,
+        regime_sticky=0.92,
+        latent_vol_init=0.08,
+        latent_vol_revert=0.94,
+        regime_drift_multiplier=[0.88, 1.02, 0.95, 1.10],
+        regime_noise_multiplier=[0.45, 0.75, 0.90, 1.10],
+        regime_fatigue_multiplier=[0.90, 1.00, 1.12, 1.08],
+        regime_trust_loss_multiplier=[0.88, 0.96, 1.06, 1.18],
     ),
     "task_2": TaskConfig(
         task_id="task_2",
@@ -297,6 +323,14 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         risk_tolerance_recovery=0.06,
         risk_tolerance_decay=0.10,
         resource_pressure_loss=0.04,
+        regime_init=0,
+        regime_sticky=0.88,
+        latent_vol_init=0.22,
+        latent_vol_revert=0.90,
+        regime_drift_multiplier=[0.92, 1.05, 1.02, 1.16],
+        regime_noise_multiplier=[0.55, 0.88, 1.02, 1.18],
+        regime_fatigue_multiplier=[1.00, 1.08, 1.42, 1.24],
+        regime_trust_loss_multiplier=[0.92, 1.00, 1.14, 1.28],
     ),
     "task_3": TaskConfig(
         task_id="task_3",
@@ -345,6 +379,14 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         risk_tolerance_recovery=0.05,
         risk_tolerance_decay=0.11,
         resource_pressure_loss=0.05,
+        regime_init=0,
+        regime_sticky=0.80,
+        latent_vol_init=0.18,
+        latent_vol_revert=0.88,
+        regime_drift_multiplier=[0.90, 1.24, 1.08, 1.32],
+        regime_noise_multiplier=[0.60, 0.96, 1.08, 1.28],
+        regime_fatigue_multiplier=[0.96, 1.08, 1.24, 1.18],
+        regime_trust_loss_multiplier=[0.92, 1.04, 1.16, 1.30],
     ),
     "task_4": TaskConfig(
         task_id="task_4",
@@ -407,6 +449,15 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         counterfactual_audit_horizon=4,
         counterfactual_audit_budget=2,
         counterfactual_fragility_threshold=0.48,
+        # === REGIME TUNING — this keeps the engine fully active but fair ===
+        regime_init=0,                    
+        regime_sticky=0.82,               
+        latent_vol_init=0.28,
+        latent_vol_revert=0.84,
+        regime_drift_multiplier=[0.92, 1.14, 1.10, 1.34],
+        regime_noise_multiplier=[0.62, 0.98, 1.08, 1.32],
+        regime_fatigue_multiplier=[0.98, 1.05, 1.32, 1.22],   
+        regime_trust_loss_multiplier=[0.94, 1.02, 1.16, 1.32],
     ),
     "task_5": TaskConfig(
         task_id="task_5",
@@ -471,8 +522,46 @@ TASK_CONFIGS: Dict[str, TaskConfig] = {
         counterfactual_audit_horizon=4,
         counterfactual_audit_budget=2,
         counterfactual_fragility_threshold=0.26,
+        regime_init=0,
+        regime_sticky=0.78,
+        latent_vol_init=0.45,
+        latent_vol_revert=0.80,
+        regime_drift_multiplier=[0.94, 1.12, 1.06, 1.24],
+        regime_noise_multiplier=[0.75, 1.10, 1.18, 1.40],
+        regime_fatigue_multiplier=[0.96, 1.08, 1.20, 1.14],
+        regime_trust_loss_multiplier=[0.96, 1.06, 1.16, 1.34],
     ),
 }
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _light_user_heterogeneity(base_cfg: TaskConfig, rng: np.random.Generator) -> TaskConfig:
+    """
+    Apply small bounded per-episode noise to user-dynamic parameters only.
+    Task identity, topic basis, grader weights, and task semantics stay fixed.
+    """
+
+    def mul(scale: float) -> float:
+        return 1.0 + float(rng.uniform(-scale, scale))
+
+    return replace(
+        base_cfg,
+        lambda_F=_clip(base_cfg.lambda_F * mul(0.08), 0.70, 0.99),
+        delta_F=_clip(base_cfg.delta_F * mul(0.12), 0.05, 0.40),
+        trust_gain=_clip(base_cfg.trust_gain * mul(0.12), 0.05, 0.40),
+        trust_loss=_clip(base_cfg.trust_loss * mul(0.12), 0.05, 0.50),
+        trust_volatility=_clip(base_cfg.trust_volatility * mul(0.15), 0.0, 0.30),
+        latent_vol_init=_clip(base_cfg.latent_vol_init * mul(0.12), 0.0, 1.0),
+        regime_sticky=_clip(base_cfg.regime_sticky * mul(0.06), 0.60, 0.98),
+        chi_init=_clip(base_cfg.chi_init * mul(0.08), 0.60, 0.95),
+        budget_init=_clip(base_cfg.budget_init * mul(0.05), 0.70, 1.0),
+        risk_tolerance_init=_clip(base_cfg.risk_tolerance_init * mul(0.05), 0.65, 1.0),
+        latency_budget_init=_clip(base_cfg.latency_budget_init * mul(0.05), 0.65, 1.0),
+    )
+
 
 def get_task_config(task_id: str) -> TaskConfig:
     if task_id not in TASK_CONFIGS:

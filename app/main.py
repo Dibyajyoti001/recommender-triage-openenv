@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from .models import Action, EnvironmentState, FinalGradeBreakdown, GraderResponse, Observation, StepResult, TaskListResponse
-from .simulator import RecommendationPolicyEnvironment
+from .simulator import REGIME_NAMES, RecommendationPolicyEnvironment
 from .tasks import list_task_specs
 
 
@@ -49,6 +49,21 @@ class MCPResponse(BaseModel):
     jsonrpc: str
     id: Any = None
     error: Dict[str, Any]
+
+
+class VisualizationResponse(BaseModel):
+    session_id: str
+    task_id: str
+    turns: List[int]
+    regimes: List[int]
+    regime_labels: List[str]
+    latent_vol: List[float]
+    trust: List[float]
+    engagement: List[float]
+    observed_feedback: List[float]
+    feedback_volatility: List[float]
+    repetition_pressure: List[float]
+    slot_types: List[str]
 
 
 def _task_ids() -> List[str]:
@@ -245,3 +260,42 @@ def baseline_endpoint(num_runs: int = Query(default=3, ge=1, le=20)) -> Baseline
 
     average_score = round(sum(task_scores.values()) / len(task_scores), 6)
     return BaselineResponse(task_scores=task_scores, average_score=average_score)
+
+
+@app.get("/visualize", response_model=VisualizationResponse)
+def visualize_endpoint(
+    session_id: str = Query(default=_DEFAULT_SESSION_ID),
+) -> VisualizationResponse:
+    env = _get_env(session_id)
+    task_id = env.hidden.task_id if env.hidden is not None else "unknown"
+
+    if not env.trajectory:
+        return VisualizationResponse(
+            session_id=session_id,
+            task_id=task_id,
+            turns=[],
+            regimes=[],
+            regime_labels=[],
+            latent_vol=[],
+            trust=[],
+            engagement=[],
+            observed_feedback=[],
+            feedback_volatility=[],
+            repetition_pressure=[],
+            slot_types=[],
+        )
+
+    return VisualizationResponse(
+        session_id=session_id,
+        task_id=task_id,
+        turns=[step.turn_id for step in env.trajectory],
+        regimes=[step.regime for step in env.trajectory],
+        regime_labels=[REGIME_NAMES[step.regime] for step in env.trajectory],
+        latent_vol=[round(step.latent_vol, 6) for step in env.trajectory],
+        trust=[round(step.trust_after, 6) for step in env.trajectory],
+        engagement=[round(step.p_after, 6) for step in env.trajectory],
+        observed_feedback=[round(step.observed_feedback, 6) for step in env.trajectory],
+        feedback_volatility=[round(step.feedback_volatility, 6) for step in env.trajectory],
+        repetition_pressure=[round(step.repetition_pressure, 6) for step in env.trajectory],
+        slot_types=[step.slot_type for step in env.trajectory],
+    )

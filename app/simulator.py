@@ -27,7 +27,7 @@ from .reward import (
     pressure_bucket,
     update_patience,
 )
-from .tasks import CATEGORY_NAMES, GLOBAL, K, TaskConfig, get_task_config
+from .tasks import CATEGORY_NAMES, GLOBAL, K, TaskConfig, _light_user_heterogeneity, get_task_config
 from .graders import final_grade
 
 
@@ -49,6 +49,9 @@ def _rolling_mean(values: List[float], window: int) -> Tuple[float, int]:
         return 0.0, 0
     clipped = values[-window:]
     return float(sum(clipped) / len(clipped)), len(clipped)
+
+
+REGIME_NAMES: Tuple[str, ...] = ("stable", "drifting", "fatigued", "distressed")
 
 
 @dataclass
@@ -83,6 +86,8 @@ class TrajectoryStep:
     trust_collapsed: bool
     risk_collapsed: bool
     diversity_collapsed: bool
+    regime: int
+    latent_vol: float
     exploration_flag: bool
     confidence_score: float
 
@@ -122,6 +127,7 @@ class RecommendationPolicyEnvironment:
         self,
         history: Optional[List[float]] = None,
         floor_override: Optional[float] = None,
+        latent_override: Optional[float] = None,
     ) -> float:
         assert self.task_cfg is not None
         values = self.hidden.feedback_history if history is None else history
@@ -134,7 +140,13 @@ class RecommendationPolicyEnvironment:
             floor = float(floor_override)
         else:
             floor = float(self.hidden.volatility_floor) if self.hidden is not None else 0.0
-        return max(base, floor)
+        if latent_override is not None:
+            latent_shadow = 0.12 * float(latent_override)
+        elif self.hidden is not None:
+            latent_shadow = 0.12 * float(self.hidden.latent_vol)
+        else:
+            latent_shadow = 0.0
+        return max(base, floor, latent_shadow)
 
     def _recent_concentration(self, chosen_category: int) -> float:
         assert self.task_cfg is not None
@@ -171,6 +183,8 @@ class RecommendationPolicyEnvironment:
         feedback_volatility: float,
         saturation_triggered: bool,
         resource_pressure: float,
+        regime: int,
+        latent_vol: float,
     ) -> float:
         assert self.task_cfg is not None
 
@@ -183,10 +197,95 @@ class RecommendationPolicyEnvironment:
         loss += self.task_cfg.trust_volatility * feedback_volatility
         loss += self.task_cfg.resource_pressure_loss * resource_pressure
 
+        regime_loss_mult = self.task_cfg.regime_trust_loss_multiplier[regime]
+        gain *= max(0.80, 1.0 - 0.10 * latent_vol * regime)
+        loss *= regime_loss_mult
+        if regime == 2:
+            loss += 0.05 * latent_vol
+        elif regime == 3:
+            loss += 0.12 * latent_vol
+
         if saturation_triggered:
             loss += 0.10
 
         return float(np.clip(pre_trust + gain - loss, 0.0, 1.0))
+
+    def _update_regime(
+        self,
+        *,
+        trust: float,
+        patience: float,
+        repetition_pressure: float,
+        latent_vol: float,
+        alignment: float,
+    ) -> int:
+        assert self.hidden is not None
+        assert self.task_cfg is not None
+
+        current = int(self.hidden.regime)
+        probs = np.full(4, 1e-4, dtype=float)
+        probs[current] += float(self.task_cfg.regime_sticky)
+
+        stable_relief = float(
+            np.clip(
+                0.40 * np.clip((trust - 0.60) / 0.25, 0.0, 1.0)
+                + 0.30 * np.clip((patience - 0.60) / 0.25, 0.0, 1.0)
+                + 0.15 * np.clip((0.45 - repetition_pressure) / 0.45, 0.0, 1.0)
+                + 0.15 * np.clip((0.30 - latent_vol) / 0.30, 0.0, 1.0),
+                0.0,
+                1.0,
+            )
+        )
+        drift_pressure = float(
+            np.clip(
+                0.60 * np.clip((0.35 - alignment) / 0.35, 0.0, 1.0)
+                + 0.40 * np.clip((latent_vol - 0.35) / 0.40, 0.0, 1.0),
+                0.0,
+                1.0,
+            )
+        )
+        fatigue_pressure = float(np.clip((repetition_pressure - 0.52) / 0.30, 0.0, 1.0))
+        distress_pressure = float(
+            np.clip(
+                max(
+                    np.clip((0.46 - trust) / 0.30, 0.0, 1.0),
+                    np.clip((0.36 - patience) / 0.28, 0.0, 1.0),
+                )
+                + 0.25 * fatigue_pressure
+                + 0.20 * np.clip((latent_vol - 0.55) / 0.30, 0.0, 1.0),
+                0.0,
+                1.0,
+            )
+        )
+
+        probs[0] += 0.20 + 0.40 * stable_relief
+        probs[1] += 0.12 + 0.55 * drift_pressure
+        probs[2] += 0.10 + 0.60 * fatigue_pressure
+        probs[3] += 0.08 + 0.70 * distress_pressure
+
+        if current == 0:
+            probs *= np.asarray([1.00, 1.05, 1.10, 1.15])
+        elif current == 1:
+            probs *= np.asarray([0.80, 1.00, 1.05, 1.10])
+        elif current == 2:
+            probs *= np.asarray([0.65, 0.85, 1.00, 1.12])
+        else:
+            probs *= np.asarray([0.50, 0.70, 0.88, 1.00])
+
+        probs = probs / float(probs.sum())
+        return int(self.rng.choice(4, p=probs))
+
+    def _update_latent_vol(self, prev_latent_vol: float, regime: int) -> float:
+        assert self.task_cfg is not None
+        regime_targets = [0.08, 0.26, 0.44, 0.68]
+        target = regime_targets[int(max(0, min(3, regime)))]
+        noise_scale = 0.015 + 0.035 * self.task_cfg.regime_noise_multiplier[regime]
+        updated = (
+            self.task_cfg.latent_vol_revert * prev_latent_vol
+            + (1.0 - self.task_cfg.latent_vol_revert) * target
+            + noise_scale * float(self.rng.normal())
+        )
+        return float(np.clip(updated, 0.0, 1.0))
 
     def reset(self, task_id: str, seed: Optional[int] = None) -> Observation:
         if seed is not None:
@@ -194,6 +293,7 @@ class RecommendationPolicyEnvironment:
             self.rng = np.random.default_rng(self.seed)
 
         self.task_cfg = get_task_config(task_id)
+        self.task_cfg = _light_user_heterogeneity(self.task_cfg, self.rng)
         self.recent_interactions = []
         self.trajectory = []
         self.latest_reward_breakdown = None
@@ -242,6 +342,8 @@ class RecommendationPolicyEnvironment:
             risk_history=[],
             diversity_history=[],
             rng_seed=self.seed,
+            regime=int(self.task_cfg.regime_init),
+            latent_vol=float(self.task_cfg.latent_vol_init),
         )
 
         self.candidate_items = build_candidate_pool(
@@ -261,6 +363,8 @@ class RecommendationPolicyEnvironment:
             risk_tolerance=self.hidden.risk_tolerance,
             latency_budget=self.hidden.latency_budget,
             diversity_collapsed=self.hidden.diversity_collapsed,
+            regime=self.hidden.regime,
+            latent_vol=self.hidden.latent_vol,
         )
         return self._build_observation(session_feedback_signal=0.5)
 
@@ -522,13 +626,28 @@ class RecommendationPolicyEnvironment:
             or replay_env.hidden.diversity_collapsed
         ):
             collapse_free = 0.0
+        regime_health = 1.0
+        if replay_env.trajectory:
+            regime_health = float(
+                np.clip(
+                    1.0
+                    - sum(
+                        (step.regime / 3.0) * (0.40 + 0.60 * step.latent_vol)
+                        for step in replay_env.trajectory
+                    )
+                    / len(replay_env.trajectory),
+                    0.0,
+                    1.0,
+                )
+            )
 
         return float(
             np.clip(
-                0.55 * return_score
+                0.50 * return_score
                 + 0.20 * terminal_trust
                 + 0.15 * risk_safe
-                + 0.10 * collapse_free,
+                + 0.10 * collapse_free
+                + 0.05 * regime_health,
                 0.0,
                 1.0,
             )
@@ -579,6 +698,7 @@ class RecommendationPolicyEnvironment:
             feedback_volatility=self._feedback_volatility(
                 snapshot.hidden_state.feedback_history,
                 floor_override=snapshot.hidden_state.volatility_floor,
+                latent_override=snapshot.hidden_state.latent_vol,
             ),
             repetition_pressure=repetition_pressure,
         )
@@ -588,6 +708,7 @@ class RecommendationPolicyEnvironment:
             feedback_volatility=self._feedback_volatility(
                 snapshot.hidden_state.feedback_history,
                 floor_override=snapshot.hidden_state.volatility_floor,
+                latent_override=snapshot.hidden_state.latent_vol,
             ),
             repetition_pressure=repetition_pressure,
         )
@@ -717,8 +838,12 @@ class RecommendationPolicyEnvironment:
         pre_budget_remaining = float(self.hidden.budget_remaining)
         pre_risk_tolerance = float(self.hidden.risk_tolerance)
         pre_latency_budget = float(self.hidden.latency_budget)
+        pre_regime = int(self.hidden.regime)
+        pre_latent_vol = float(self.hidden.latent_vol)
         pre_volatility = self._feedback_volatility()
         pre_argmax_z = int(np.argmax(np.asarray(pre_z)))
+        pre_alignment = _dot(pre_z, pre_m)
+        pre_rep_pressure = _dot(pre_H, pre_z)
 
         chosen_x = list(
             chosen.topic_vector
@@ -726,6 +851,28 @@ class RecommendationPolicyEnvironment:
             or [1.0 if i == chosen.category_id else 0.0 for i in range(K)]
         )
         realized_item, is_dud = self._realized_item(chosen)
+
+        drift_trigger_turn = 4 + (self.hidden.rng_seed % 4)
+        new_regime = self._update_regime(
+            trust=pre_trust,
+            patience=pre_p,
+            repetition_pressure=pre_rep_pressure,
+            latent_vol=pre_latent_vol,
+            alignment=pre_alignment,
+        )
+        if (
+            self.hidden.task_id == "task_3"
+            and self.hidden.turn == drift_trigger_turn
+            and self.hidden.drift_turn is None
+        ):
+            new_regime = max(new_regime, 1)
+        new_latent_vol = self._update_latent_vol(pre_latent_vol, new_regime)
+        if new_regime == 3:
+            new_latent_vol = max(new_latent_vol, 0.52)
+        elif new_regime == 2:
+            new_latent_vol = max(new_latent_vol, 0.34)
+        elif new_regime == 1:
+            new_latent_vol = max(new_latent_vol, 0.18)
 
         self._maybe_record_counterfactual_snapshot(
             chosen=chosen,
@@ -776,8 +923,9 @@ class RecommendationPolicyEnvironment:
         )
         self.latest_reward_breakdown = reward_breakdown
 
+        fatigue_mult = self.task_cfg.regime_fatigue_multiplier[new_regime] * (1.0 + 0.35 * new_latent_vol)
         new_F_topic = [
-            float(self.task_cfg.lambda_F * pre_F[i] + self.task_cfg.delta_F * chosen_x[i])
+            float(self.task_cfg.lambda_F * pre_F[i] + self.task_cfg.delta_F * fatigue_mult * chosen_x[i])
             for i in range(K)
         ]
 
@@ -814,7 +962,11 @@ class RecommendationPolicyEnvironment:
 
         y_t = float(aux["satisfaction_proxy"])
         observed_feedback = y_t
-        effective_noise_std = self.task_cfg.feedback_noise_std + float(self.hidden.risk_noise_floor)
+        effective_noise_std = (
+            self.task_cfg.feedback_noise_std
+            + 0.04 * new_latent_vol * self.task_cfg.regime_noise_multiplier[new_regime]
+            + float(self.hidden.risk_noise_floor)
+        )
         if effective_noise_std > 0.0:
             observed_feedback = float(
                 np.clip(
@@ -826,7 +978,10 @@ class RecommendationPolicyEnvironment:
 
         new_feedback_history = list(self.hidden.feedback_history)
         new_feedback_history.append(observed_feedback)
-        post_volatility = self._feedback_volatility(new_feedback_history)
+        post_volatility = self._feedback_volatility(
+            new_feedback_history,
+            latent_override=new_latent_vol,
+        )
 
         new_budget_remaining = float(
             np.clip(
@@ -860,6 +1015,8 @@ class RecommendationPolicyEnvironment:
             feedback_volatility=pre_volatility,
             saturation_triggered=saturation_triggered,
             resource_pressure=float(aux["resource_pressure"]),
+            regime=new_regime,
+            latent_vol=new_latent_vol,
         )
 
         new_trust_collapsed = bool(
@@ -906,25 +1063,37 @@ class RecommendationPolicyEnvironment:
         z_arr = np.asarray(pre_z, dtype=float)
         m_arr = np.asarray(pre_m, dtype=float)
         phi_t, psi_t = self._drift_targets(z_arr, m_arr, self.hidden.task_id)
-
-        # Drift turn now depends on the episode seed, so Task 3 is no longer always fixed at turn 4.
-        drift_trigger_turn = 4 + (self.hidden.rng_seed % 4)  # one of 4, 5, 6, 7
-
-        if (
+        forced_conflict = (
             self.hidden.task_id == "task_3"
             and self.hidden.turn == drift_trigger_turn
             and self.hidden.drift_turn is None
-        ):
-            new_z = _normalize(psi_t)
-            self.hidden.drift_turn = self.hidden.turn
+        )
+        drift_mult = self.task_cfg.regime_drift_multiplier[new_regime] * (1.0 + 0.35 * new_latent_vol)
+        noise_mult = self.task_cfg.regime_noise_multiplier[new_regime] * new_latent_vol
+
+        if forced_conflict:
+            z_target = psi_t
+            base_rate = max(0.72, min(0.95, self.task_cfg.kappa * drift_mult + 0.30))
         elif new_p > self.task_cfg.tau:
-            mu_eff = self.task_cfg.mu * (0.80 + 0.40 * new_trust)
-            new_z = (1.0 - mu_eff) * z_arr + mu_eff * phi_t
-            new_z = _normalize(new_z)
+            z_target = phi_t
+            base_rate = self.task_cfg.mu * (0.80 + 0.40 * new_trust)
         else:
-            kappa_eff = min(0.95, self.task_cfg.kappa + self.task_cfg.drift_trust_boost * (1.0 - new_trust))
-            new_z = (1.0 - kappa_eff) * z_arr + kappa_eff * psi_t
-            new_z = _normalize(new_z)
+            z_target = psi_t
+            base_rate = min(0.95, self.task_cfg.kappa + self.task_cfg.drift_trust_boost * (1.0 - new_trust))
+
+        step_rate = float(
+            np.clip(
+                base_rate * drift_mult,
+                0.02 if new_p > self.task_cfg.tau and not forced_conflict else 0.05,
+                0.98,
+            )
+        )
+        noise_scale = 0.015 + 0.05 * noise_mult
+        new_z = (1.0 - step_rate) * z_arr + step_rate * np.asarray(z_target, dtype=float)
+        new_z = new_z + self.rng.normal(0.0, noise_scale, size=K)
+        new_z = _normalize(new_z)
+        if forced_conflict:
+            self.hidden.drift_turn = self.hidden.turn
 
         post_argmax_z = int(np.argmax(new_z))
         drift_happened = (post_argmax_z != pre_argmax_z)
@@ -933,6 +1102,16 @@ class RecommendationPolicyEnvironment:
 
         alignment = float(np.dot(new_z, m_arr))
         new_chi = float(np.clip(pre_chi + GLOBAL.alpha_chi * (alignment - GLOBAL.theta_chi), 0.0, 1.0))
+        if new_trust_collapsed or new_risk_collapsed:
+            new_regime = max(new_regime, 3)
+            new_latent_vol = max(new_latent_vol, 0.58)
+        elif new_diversity_collapsed or saturation_triggered:
+            new_regime = max(new_regime, 2)
+            new_latent_vol = max(new_latent_vol, 0.40)
+        elif drift_happened:
+            new_regime = max(new_regime, 1)
+            new_latent_vol = max(new_latent_vol, 0.22)
+
         platform_gain = float(
             np.clip(
                 0.45 * observed_feedback
@@ -977,6 +1156,8 @@ class RecommendationPolicyEnvironment:
                 trust_collapsed=new_trust_collapsed,
                 risk_collapsed=new_risk_collapsed,
                 diversity_collapsed=new_diversity_collapsed,
+                regime=new_regime,
+                latent_vol=float(new_latent_vol),
                 exploration_flag=action.exploration_flag,
                 confidence_score=action.confidence_score,
             )
@@ -1023,6 +1204,8 @@ class RecommendationPolicyEnvironment:
         self.hidden.diversity_collapsed = bool(new_diversity_collapsed)
         self.hidden.risk_noise_floor = float(risk_noise_floor)
         self.hidden.volatility_floor = float(volatility_floor)
+        self.hidden.regime = int(new_regime)
+        self.hidden.latent_vol = float(new_latent_vol)
 
         if self.hidden.p <= 1e-8:
             self._zero_patience_streak += 1
@@ -1051,6 +1234,9 @@ class RecommendationPolicyEnvironment:
             "trust_collapsed": new_trust_collapsed,
             "risk_collapsed": new_risk_collapsed,
             "diversity_collapsed": new_diversity_collapsed,
+            "regime": int(new_regime),
+            "regime_name": REGIME_NAMES[int(new_regime)],
+            "latent_vol": float(round(new_latent_vol, 6)),
             "latent_dud": is_dud,
         }
 
@@ -1072,6 +1258,8 @@ class RecommendationPolicyEnvironment:
                 risk_tolerance=self.hidden.risk_tolerance,
                 latency_budget=self.hidden.latency_budget,
                 diversity_collapsed=self.hidden.diversity_collapsed,
+                regime=self.hidden.regime,
+                latent_vol=self.hidden.latent_vol,
             )
             obs = self._build_observation(session_feedback_signal=float(observed_feedback))
         else:

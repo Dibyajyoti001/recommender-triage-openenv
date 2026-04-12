@@ -149,6 +149,8 @@ def build_candidate_pool(
     risk_tolerance: float = 1.0,
     latency_budget: float = 1.0,
     diversity_collapsed: bool = False,
+    regime: int = 0,
+    latent_vol: float = 0.15,
 ) -> List[CandidateItem]:
     cfg = get_task_config(task_id)
 
@@ -161,6 +163,8 @@ def build_candidate_pool(
     anti_m = _anti_distribution(m_vec)
     anti_z = _anti_distribution(z_vec)
     trust = _clip01(trust_level)
+    regime = int(max(0, min(3, regime)))
+    latent_vol = _clip01(latent_vol)
     trust_repair = max(0.0, 0.65 - trust)
     budget_pressure = max(0.0, 0.60 - _clip01(budget_remaining))
     latency_pressure = max(0.0, 0.60 - _clip01(latency_budget))
@@ -240,6 +244,50 @@ def build_candidate_pool(
             [0.30 * least_recent_oh[i] for i in range(K)],
         )
 
+    if regime == 1:
+        conflict = _blend_sparse(
+            [0.56 * conflict[i] for i in range(K)],
+            [0.24 * anti_m[i] for i in range(K)],
+            [0.20 * least_recent_oh[i] for i in range(K)],
+        )
+        balanced = _blend_sparse(
+            [0.52 * balanced[i] for i in range(K)],
+            [0.24 * conflict[i] for i in range(K)],
+            [0.24 * (1.0 - h_vec[i]) for i in range(K)],
+        )
+    elif regime == 2:
+        fatigue_trap = _blend_sparse(
+            [0.80 * z_vec[i] for i in range(K)],
+            [0.14 * h_vec[i] for i in range(K)],
+            [0.06 * f_vec[i] for i in range(K)],
+        )
+        exploration = _blend_sparse(
+            [0.34 * z_vec[i] for i in range(K)],
+            [0.34 * (1.0 - h_vec[i]) for i in range(K)],
+            [0.32 * least_recent_oh[i] for i in range(K)],
+        )
+    elif regime == 3:
+        live_vec = _blend_sparse(
+            [0.52 * z_vec[i] for i in range(K)],
+            [0.22 * u_vec[i] for i in range(K)],
+            [0.26 * least_recent_oh[i] for i in range(K)],
+        )
+        mem_vec = _blend_sparse(
+            [0.48 * m_vec[i] for i in range(K)],
+            [0.26 * u_vec[i] for i in range(K)],
+            [0.26 * least_recent_oh[i] for i in range(K)],
+        )
+        balanced = _blend_sparse(
+            [0.40 * z_vec[i] for i in range(K)],
+            [0.26 * m_vec[i] for i in range(K)],
+            [0.34 * least_recent_oh[i] for i in range(K)],
+        )
+        exploration = _blend_sparse(
+            [0.28 * z_vec[i] for i in range(K)],
+            [0.30 * (1.0 - h_vec[i]) for i in range(K)],
+            [0.42 * least_recent_oh[i] for i in range(K)],
+        )
+
     if diversity_collapsed:
         live_vec = _blend_sparse(
             [0.45 * z_vec[i] for i in range(K)],
@@ -277,6 +325,7 @@ def build_candidate_pool(
             "conflict_option": (0.35, 0.52, 0.46),
         }
         base_cost, base_risk, base_latency = resource_profiles[slot_type]
+        quality = float(_clip01(quality))
 
         if freshness == "novel":
             base_risk += 0.06
@@ -295,6 +344,35 @@ def build_candidate_pool(
         if diversity_collapsed and slot_type in {"live_best_fresh", "memory_best_fresh"}:
             base_risk += 0.06
             base_cost += 0.05
+
+        if regime == 0:
+            if slot_type in {"live_best_fresh", "memory_best_fresh"}:
+                quality = _clip01(quality + 0.03 * (1.0 - latent_vol))
+                base_risk -= 0.05 * (1.0 - latent_vol)
+        elif regime == 1:
+            if slot_type == "conflict_option":
+                quality = _clip01(quality + 0.06 + 0.04 * latent_vol)
+                base_risk -= 0.03
+            elif slot_type == "balanced_bridge":
+                quality = _clip01(quality + 0.03 + 0.03 * latent_vol)
+                base_latency -= 0.02
+        elif regime == 2:
+            if slot_type == "fatigue_trap":
+                quality = _clip01(quality + 0.05 + 0.04 * latent_vol)
+                base_risk += 0.12 + 0.05 * latent_vol
+                base_cost += 0.05
+            elif slot_type == "exploration_option":
+                quality = _clip01(quality + 0.03 + 0.02 * latent_vol)
+        else:
+            if slot_type in {"balanced_bridge", "exploration_option"}:
+                quality = _clip01(quality + 0.05 + 0.03 * latent_vol)
+                base_risk -= 0.12
+                base_cost -= 0.06
+                base_latency -= 0.06
+            elif slot_type in {"live_best_fresh", "memory_best_fresh", "fatigue_trap"}:
+                base_risk += 0.10
+                base_cost += 0.05
+                base_latency += 0.03
 
         cost = _sample_resource(rng, center=base_cost, spread=0.07)
         risk = _sample_resource(rng, center=base_risk, spread=0.07)
@@ -322,6 +400,8 @@ def build_candidate_pool(
                     "cost_hint": float(round(cost, 4)),
                     "risk_hint": float(round(risk, 4)),
                     "latency_hint": float(round(latency, 4)),
+                    "regime": regime,
+                    "latent_vol": float(round(latent_vol, 4)),
                 },
             )
         )

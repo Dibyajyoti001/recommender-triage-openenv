@@ -6,450 +6,261 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
-short_description: OpenEnv benchmark for trust-aware session recommendation.
+short_description: OpenEnv benchmark for trust-aware session recommendation under uncertainty.
 ---
 
 # Recommendation Policy Triage
 
-Recommendation Policy Triage is an OpenEnv-compatible benchmark for **session-level recommendation control under uncertainty**.
-It evaluates not just what an agent recommends next, but how well it manages **user satisfaction, trust, calibration, diversity, and long-horizon session health** over time.
+Recommendation Policy Triage is an OpenEnv-compatible benchmark for session-level recommendation control under uncertainty.
 
-This environment is designed to feel closer to real recommender decision-making than one-step ranking benchmarks:
+It evaluates not just what an agent recommends next, but how well it manages user satisfaction, trust, calibration, diversity, and long-horizon session health across a full 20-step session.
 
-- user feedback can be noisy
-- delayed failure modes exist
-- trust can erode and recover
-- diversity and relevance can conflict
-- visible cost, risk, and latency constraints matter
-- the agent only sees a partial view of the true user state
+The environment frames recommendation as a sequential partially observable control problem (POMDP) rather than a one-step ranking task. At each step, the agent must decide:
+
+what to recommend
+when to explore
+how much confidence to assign to that decision
+
+while operating under visible system constraints such as cost, risk, latency, and budget, and hidden user dynamics such as intent drift, fatigue accumulation, trust erosion, and latent regime shifts.
+
+In other words, the benchmark is designed to test whether a policy can make recommendations that are not only locally relevant, but also robust, calibrated, and sustainable over time — the core challenge faced by real recommender systems operating over full user sessions.
+
+
 
 **Team:** Neonatal  
 **Authors:** Dibyajyoti001, ankannayek  
 **Hugging Face Space:** [dibyajyoti001-recommender-triage-openenv](https://dibyajyoti001-recommender-triage-openenv.hf.space)
 
-## Why This Benchmark Matters
+---
 
-Most recommendation tasks stop at short-horizon optimization:
+## Problem Statement & Why This Benchmark Matters
 
-- maximize next-click probability
-- predict the next consumed item
-- rank a static candidate set
+Most recommendation benchmarks focus only on short-horizon objectives:
 
-Production systems have a harder objective:
+- next-click prediction
+- next-item prediction
+- one-step ranking
+- static candidate scoring
 
-- serve relevant content without trapping the user in repetition
-- recognize when historical memory is no longer trustworthy
-- stay calibrated when observed feedback is unstable
-- protect long-term trust after mistakes
-- operate under safety, latency, and budget pressure
+These tasks are useful for offline evaluation, but they do **not** capture the actual control problem faced by a live recommender policy operating over a full user session.
 
-This benchmark reframes recommendation as a **control problem over user experience and trust**, not just a ranking problem.
+In real systems:
+- repeating similar content creates fatigue
+- historical memory can become stale
+- live user intent drifts over time
+- feedback is noisy and delayed
+- overconfidence damages long-term trust
+- operating constraints (cost, risk, latency) matter
+
+A locally strong recommendation can still be globally poor if it leads to session collapse.
+
+**Recommendation Policy Triage** reframes recommendation as a **trust-aware, long-horizon control problem** under partial observability and latent regime shifts. It directly evaluates policies on user experience, trust preservation, and session health - the metrics that actually matter in production recommenders.
+
+---
 
 ## Benchmark At A Glance
 
-- **5 tasks** covering stable exploitation, fatigue control, memory conflict, echo-chamber prevention, and noisy calibration
-- **Structured action space** with recommendation choice, exploration intent, and confidence declaration
-- **Partially observable state** with hidden memory, live intent, fatigue, trust, and patience
-- **Analytically generated candidate pool** that evolves with session state
-- **Visible operating constraints** through `cost`, `risk`, `latency`, `budget_remaining`, `risk_tolerance`, and `latency_budget`
-- **Trajectory-level grading** with non-compensatory gating on collapse-sensitive tasks
-- **Critical-turn counterfactual audit** on fragile turns in Tasks 4 and 5
+- **5 tasks** with clear easy -> medium -> hard progression
+- **Structured action space** (item + exploration flag + confidence)
+- **Partially observable hidden state** (memory, live intent, fatigue, patience, trust, regime, volatility)
+- **Analytically generated 6-slot candidate pool** that evolves with hidden state
+- **Visible operating constraints** (cost, risk, latency, budgets)
+- **Regime-conditioned latent volatility** (stable / drifting / fatigued / distressed + stochastic volatility)
+- **Light domain randomization** at reset (each episode simulates a slightly different user)
+- **Trajectory-level non-compensatory grading**
+- **Counterfactual audit** on fragile turns (Tasks 4 & 5)
+- **Live visualization** endpoint (`/visualize`)
 
-## What The Agent Controls
+---
 
-Each step the policy returns:
+## What The Environment Evaluates
 
-- `recommended_item_id`
-- `exploration_flag`
-- `confidence_score`
+The benchmark tests whether a policy can:
 
-That means the agent must decide both:
+- exploit stable preference when memory is reliable
+- avoid excessive repetition as fatigue accumulates
+- detect conflict between historical memory and live intent
+- adapt after intent drift
+- use exploration deliberately rather than randomly
+- calibrate confidence under uncertainty
+- act under visible budget, risk, and latency constraints
+- preserve trust and session health over the full horizon instead of optimizing only the next step
 
-- what content to serve
-- how strongly to stand behind that choice
+---
 
-Confidence is not cosmetic. Overclaiming can hurt trust and final score.
+## What The Agent Controls & Observes
 
-## What The Agent Observes
+**Action**
 
-The observation exposes only coarse, policy-usable signals:
+```python
+class Action(BaseModel):
+    recommended_item_id: int
+    exploration_flag: bool
+    confidence_score: float   # 0.0 - 1.0
+```
 
-- task metadata
-- memory summary over the 10-topic basis
-- recent interactions
-- candidate items
-- repetition counts
-- repetition pressure bucket
-- memory confidence bucket and scalar
-- current feedback signal
-- feedback volatility
-- trust signal
-- engagement signal
-- budget remaining
-- risk tolerance
-- latency budget
+**Observation** (partial signals only - full hidden state is never exposed)
 
-The agent does **not** directly observe hidden intent, hidden fatigue state, hidden trust dynamics, or the true internal user model.
+The agent sees task metadata, memory summary, recent interactions, 6 candidate items with visible cost/risk/latency, repetition pressure, feedback volatility, trust signal, engagement signal, and resource budgets.
 
-## Hidden State
+---
 
-Each episode maintains:
+## Hidden User State
 
-- `m`: long-term memory preference
-- `z`: live session intent
-- `F_topic`: fast fatigue accumulator
-- `H_topic`: slow repetition-pressure accumulator
-- `p`: engagement / patience reserve
-- `chi`: memory reliability
-- `trust`: user-system relationship state
+Each episode maintains a rich hidden state:
 
-These hidden variables evolve throughout the session and shape the candidate pool, satisfaction, and final grade.
+| Variable | Description |
+|----------------|-------------|
+| `m` | Long-term memory preference (10-topic basis) |
+| `z` | Live session intent (10-topic basis) |
+| `F_topic` | Fast fatigue accumulator |
+| `H_topic` | Slow repetition-pressure accumulator |
+| `p` | Engagement / patience reserve |
+| `chi` | Memory reliability |
+| `trust` | User-system relationship state |
+| `regime` | Latent mode: 0=stable, 1=drifting, 2=fatigued, 3=distressed |
+| `latent_vol` | Latent volatility scalar [0,1] that modulates drift, noise, fatigue, trust sensitivity |
 
-## Fixed Topic Basis
+**New:** `regime` and `latent_vol` create persistent, realistic shifts. Transitions are sticky (hysteresis) and depend on trust, patience, repetition pressure, and alignment.
 
-All mixed-topic representations use one shared 10-topic basis:
+**New:** Light domain randomization at `reset()` perturbs user-dynamic parameters (fatigue sensitivity, trust gain/loss, volatility base, regime stickiness, etc.) so each episode simulates a **slightly different real user** while keeping task identity intact.
 
-`Romance, Comedy, Drama, Thriller, Action, Documentary, Crime, SciFi, News, Lifestyle`
+---
 
-Candidates are sparse mixed-topic vectors, not just single-label categories. That lets the environment represent overlap, drift, and soft topic alignment.
+## Fixed Topic Basis & Mixed-Topic Items
+
+All computations use a fixed global 10-topic basis:
+
+| Index | Topic |
+|-------|-------------|
+| 0 | Romance |
+| 1 | Comedy |
+| 2 | Drama |
+| 3 | Thriller |
+| 4 | Action |
+| 5 | Documentary |
+| 6 | Crime |
+| 7 | SciFi |
+| 8 | News |
+| 9 | Lifestyle |
+
+Items are sparse probability distributions over this basis (not one-hot). This enables partial relevance, semantic repetition detection, and smooth fatigue.
+
+---
 
 ## Candidate Pool Design
 
-The environment does not sample from a static item catalog. Instead, each step it constructs six analytical candidate slots from the current hidden state:
+At every turn the environment generates exactly **6 analytically constructed candidates**:
 
-- `live_best_fresh`
-- `memory_best_fresh`
-- `balanced_bridge`
-- `fatigue_trap`
-- `exploration_option`
-- `conflict_option`
+| Slot | Purpose |
+|---------------------|---------|
+| live_best_fresh | Aligned with current live intent `z` |
+| memory_best_fresh | Aligned with long-term memory `m` |
+| balanced_bridge | Blend of `z` and `m` |
+| fatigue_trap | Tempting but repetition-heavy |
+| exploration_option | Diversification candidate |
+| conflict_option | Opposing-signal candidate |
 
-This makes the environment state-sensitive across the whole session. As trust, fatigue, drift, and collapse evolve, the candidate pool changes with them.
+The relative attractiveness and damage of each slot is **regime-conditioned** (e.g. fatigue_trap becomes more seductive in fatigued/distressed regimes). The pool is never sampled from a static catalog - it evolves with hidden state.
 
-Every candidate also carries visible resource metadata:
+---
 
-- `cost`
-- `risk`
-- `latency`
+## Task Suite (Detailed)
 
-## Task Suite
+**task_1 - Stable Preference Exploitation** (Easy)  
+Memory is reliable and live intent mostly agrees. Policy should exploit efficiently.
 
-### `task_1` Stable Preference Exploitation
+**task_2 - Repetition Fatigue Control** (Medium)  
+Strong narrow preference but repetition quickly reduces satisfaction. Must balance relevance and diversity.
 
-Historical memory is reliable and live intent mostly agrees with it.
-The correct policy exploits stable preference efficiently without over-exploring.
+**task_3 - Memory vs Live Signal Conflict** (Hard)  
+Historical memory and live behavior diverge. Must detect drift and recover.
 
-Primary failure mode: unnecessary exploration or wasteful resource use.
+**task_4 - Echo Chamber Collapse** (Hard)  
+Early recommendations look excellent but create slow saturation. Must diversify **before** collapse becomes obvious.
 
-### `task_2` Repetition Fatigue Control
+**task_5 - Noisy Signal Calibration** (Hard)  
+Feedback is noisy. Must lower confidence under volatility while preserving relevance and trust.
 
-The user strongly prefers a narrow topic region, but repeated recommendations create fatigue.
-The policy must balance relevance and diversity before short-term wins become long-term decline.
+---
 
-Primary failure mode: greedy repetition.
+## Core Dynamics (All Formulas)
 
-### `task_3` Memory vs Live Signal Conflict
+**Relevance**
 
-Historical memory and live session behavior diverge.
-The policy must stop over-trusting stale memory and recover relevance after drift.
-
-Primary failure mode: stale-memory lock-in.
-
-### `task_4` Echo Chamber Collapse
-
-The session starts with deceptively strong relevance in one narrow region.
-If the policy keeps serving that loop, slow-history pressure saturates, trust erodes, and recovery becomes sticky.
-
-Primary failure mode: reactive behavior that diversifies too late.
-
-### `task_5` Noisy Signal Calibration
-
-Observed feedback is noisy and aligned-looking items can still disappoint.
-The policy must lower confidence under volatility while still preserving trust and relevance.
-
-Primary failure mode: persistent overconfidence under uncertainty.
-
-## Core Dynamics
-
-### Relevance
-
-For candidate topic vector `x_i` and quality `q_i`:
-
-`R_t(i) = (alpha * z_t^T x_i + (1 - alpha) * m^T x_i + eta_q * q_i) / (1 + eta_q)`
-
-### Fatigue And Repetition
-
-The environment tracks both short-term and slow-burn repetition effects:
-
-- `F_{t+1} = lambda_F * F_t + delta_F * x_{a_t}`
-- `H_{t+1} = normalize(lambda_H * H_t + (1 - lambda_H) * x_{a_t})`
-
-From these it derives:
-
-- fatigue cost `C_t(i) = F_t^T x_i`
-- repetition pressure `rho_t(i) = H_t^T x_i`
-- novelty violation `V_t(i) = max(0, rho_t(i) - nu)`
-
-### Trust-Aware Satisfaction
-
-Satisfaction is not just relevance minus penalties. It is modulated by relationship state:
-
-`y_t = sigmoid(zeta1 * R_t - zeta2 * C_t - zeta3 * V_t + zeta4 * trust_term)`
-
-The same item can feel worse to a user who no longer trusts the system.
-
-### Feedback Noise And Calibration
-
-The observed `session_feedback_signal` is not always equal to the hidden utility.
-
-In Task 5:
-
-- observed feedback includes Gaussian noise
-- the environment tracks rolling feedback volatility
-- the ideal confidence target is derived from volatility with an exponential decay mapping
-
-This makes confidence calibration an actual control problem instead of a cosmetic output field.
-
-### Resource And System-Health Overlay
-
-The benchmark adds a resource-aware overlay without replacing the original recommendation physics.
-It derives:
-
-- `resource_pressure`
-- `risk_exposure`
-- `diversity_pressure`
-
-from visible item properties and existing dynamics.
-
-This is important: the environment stays mathematically coherent because these are **derived overlays**, not a rewrite of the base relevance/fatigue model.
-
-### Collapse-Sensitive Regimes
-
-Tasks 4 and 5 include collapse-sensitive behavior:
-
-- trust collapse can cap future achievable satisfaction
-- risk collapse can raise future noise and volatility floor
-- diversity collapse can alter future candidate geometry
-
-These collapse states are triggered by **sustained unhealthy patterns**, not by one unlucky step.
-
-## Reward And Grading
-
-### Step Reward
-
-The step reward shapes local behavior:
-
-`r_t = w_r * R_t - w_f * C_t - w_n * V_t - w_u * U_t - w_conf * P_t`
-
-Where:
-
-- `U_t` penalizes unnecessary exploration
-- `P_t = max(0, confidence_score - y_t)` penalizes overclaiming
-
-The reward is clipped to `[-1, 1]`.
-
-### Final Grader
-
-The final benchmark score is trajectory-level, not just the average of step rewards.
-Available grading components include:
-
-- `satisfaction`
-- `diversity`
-- `adaptation`
-- `memory_use`
-- `trust`
-- `calibration`
-- `risk_safety`
-- `resource_efficiency`
-
-Tasks 1-3 use weighted trajectory grading.
-Tasks 4-5 use a **non-compensatory gated grader** with collapse-sensitive penalties so that catastrophic behavior cannot be averaged away by doing well on one other axis.
-
-### Counterfactual Decision Audit
-
-Tasks 4 and 5 add a light **counterfactual decision audit** on a small number of fragile turns.
-This is not a new task and it does not rewrite the simulator reward. Instead, it asks a narrower question:
-
-> Was the chosen action actually a robust local decision when a safer plausible alternative existed?
-
-For up to two fragile turns per episode, the environment:
-
-- snapshots the hidden state before the action
-- stores the visible candidate set
-- records the chosen action
-- replays a short 4-step branch from that snapshot
-
-The audit compares:
-
-- the policy's chosen action
-- a safer plausible alternative from the same candidate set
-- a greedier alternative from the same candidate set
-
-To keep the comparison fair and low-variance, replay branches use **matched per-step random seeds**.
-That means branch differences are driven much more by the action choice itself than by luck in noise or dud outcomes.
-
-The branch value mixes:
-
-- short-horizon return
-- terminal trust after replay
-- mean risk safety over the replay
-- whether replay triggered collapse
-
-The resulting audit score is blended into Tasks 4 and 5 with a small weight.
-This gives the benchmark a second lens: not only "what happened overall," but also "was the local decision robust at the moment it mattered?"
-
-## Why The Benchmark Is Useful
-
-This environment is useful for:
-
-- LLM-as-policy evaluation
-- RL training under partial observability
-- comparing exploration strategies
-- testing calibration under noisy feedback
-- stress-testing long-horizon recommender policies
-- studying reward shaping versus trajectory-level grading
-
-It is especially useful when you care about **how a policy behaves over a session**, not just whether it can rank the next item.
-
-## API
-
-### Core Environment Endpoints
-
-- `GET /`
-- `GET /tasks`
-- `POST /reset`
-- `POST /step`
-- `GET /state`
-- `GET /grader`
-- `GET /baseline`
-
-### Runtime / Validation Endpoints
-
-- `GET /health`
-- `GET /metadata`
-- `GET /schema`
-- `POST /mcp`
-
-Session isolation uses the `session_id` query parameter.
-
-## Quickstart
-
-### Local Setup
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```math
+R_t(i) = \frac{\alpha z_t^\top x_i + (1-\alpha) m^\top x_i + \eta_q q_i}{1 + \eta_q}
 ```
 
-### Run The Server
+**Fatigue & Repetition Pressure**
 
-Using uvicorn directly:
-
-```powershell
-uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
+```math
+F_{t+1} = \lambda_F F_t + \delta_F x_{a_t}
+H_{t+1} = \text{normalize}(\lambda_H H_t + (1-\lambda_H) x_{a_t})
 ```
 
-Using the packaged entry point from `pyproject.toml`:
+**Satisfaction Proxy**
 
-```powershell
-uv run server
+```math
+y_t = \sigma(\zeta_1 R_t(a_t) - \zeta_2 C_t(a_t) - \zeta_3 V_t(a_t) + \zeta_4 \cdot \text{trust_term})
 ```
 
-### Run The Inference Script
+**Patience / Engagement**
 
-Required environment variables:
-
-- `HF_TOKEN`
-
-Optional environment variables with defaults:
-
-- `API_BASE_URL`
-- `MODEL_NAME`
-- `ENV_BASE_URL`
-- `BENCHMARK`
-- `SESSION_ID`
-
-Then run:
-
-```powershell
-python inference.py
+```math
+p_{t+1} = \text{clip}(p_t + \beta (2y_t - 1), 0, 1)
 ```
 
-## Docker
+**Memory Confidence**
 
-Build and run locally:
-
-```bash
-docker build -t recommendation-policy-triage .
-docker run --rm -p 7860:7860 recommendation-policy-triage
+```math
+\chi_{t+1} = \text{clip}(\chi_t + \alpha_\chi (z_t^\top m - \theta_\chi), 0, 1)
 ```
 
-The manifest and container both serve:
+**Regime-Conditioned Volatility (New)**
+The simulator now maintains a latent regime and volatility scalar that modulate all dynamics (intent drift rate, feedback noise, fatigue growth, trust loss, candidate attractiveness). Transitions are persistent with hysteresis.
 
-`server.app:app`
+**Step Reward**
 
-## Validation
-
-Run tests:
-
-```powershell
-.venv\Scripts\python.exe -m pytest -q
+```math
+r_t = w_r R_t - w_f C_t - w_n V_t - w_u U_t - w_\text{conf} P_t
 ```
 
-Validate the repo:
+(with clipping to [-1, 1]).
 
-```powershell
-.venv\Scripts\openenv.exe validate
-```
+---
 
-Validate a running server:
+## Population Heterogeneity (Real-World Utility Boost)
 
-```powershell
-.venv\Scripts\openenv.exe validate --url http://127.0.0.1:7860
-```
+At every `reset()`, light domain randomization is applied to user-dynamic parameters (fatigue sensitivity, trust gain/loss, volatility base, regime stickiness, memory reliability, resource envelopes). This creates a distribution of slightly different users inside each task without changing task identity or public schemas. Policies must therefore generalize across plausible real-user variation - directly improving real-world utility.
 
-## Repo Layout
+---
 
-```text
-openenv_hackathon/
-  app/
-    main.py
-    models.py
-    tasks.py
-    simulator.py
-    reward.py
-    graders.py
-    candidate_pool.py
-    data.py
-  server/
-    app.py
-  tests/
-  inference.py
-  baselines.py
-  client.py
-  openenv.yaml
-  Dockerfile
-```
+## Final Grader & Counterfactual Audit
+
+The final score is **trajectory-level** and **non-compensatory** on Tasks 4 & 5. Tasks 4 & 5 also include a regime-aware counterfactual audit on up to 2 fragile turns.
+
+---
 
 ## Summary
 
-Recommendation Policy Triage is not a toy recommender benchmark.
-It is a compact testbed for **user experience and trust management under uncertainty**, with:
+Recommendation Policy Triage is a compact yet powerful testbed for **trust-aware, long-horizon recommendation control under uncertainty**. It combines:
 
-- sequential control instead of one-shot ranking
-- hidden state instead of full observability
-- calibration and trust as first-class objectives
-- delayed collapse dynamics
-- visible operating constraints
-- trajectory-level grading that rewards robust long-horizon behavior
+- sequential POMDP structure
+- regime-conditioned latent volatility
+- light domain randomization for population realism
+- trajectory-level non-compensatory grading
+- counterfactual audit on fragile turns
 
-That combination is what makes the benchmark both harder and more realistic.
+This makes the benchmark both harder and far more realistic than standard ranking benchmarks.
+
+You can now train policies that generalize across different users while preserving session health, trust, and calibration - skills that matter in real recommender systems.
+
+---
 
 ## References
+- Dudik et al. Doubly Robust Policy Evaluation and Learning
+- McInerney et al. Counterfactual Evaluation of Slate Recommendations
+- Ng et al. Policy Invariance under Reward Transformations
 
-The counterfactual decision audit in this benchmark is an environment-specific mechanism designed for sequential recommendation control. It is conceptually inspired by prior work on offline / counterfactual policy evaluation and careful reward-shaping practice:
 
-- M. Dudik, J. Langford, and L. Li. [Doubly Robust Policy Evaluation and Learning](https://arxiv.org/abs/1103.4601).
-- J. McInerney, B. Brost, P. Chandar, R. Mehrotra, and B. Carterette. [Counterfactual Evaluation of Slate Recommendations with Sequential Reward Interactions](https://arxiv.org/abs/2007.12986).
-- A. Y. Ng, D. Harada, and S. Russell. [Policy Invariance under Reward Transformations: Theory and Application to Reward Shaping](https://wordpress.andrewng.org/index.php/publication/policy-invariance-under-reward-transformations-theory-and-application-to-reward-shaping/).
