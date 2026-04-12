@@ -201,7 +201,7 @@ H_{t+1} = \text{normalize}(\lambda_H H_t + (1-\lambda_H) x_{a_t})
 
 **Satisfaction Proxy**
 
-```math
+```
 y_t = \sigma(\zeta_1 R_t(a_t) - \zeta_2 C_t(a_t) - \zeta_3 V_t(a_t) + \zeta_4 \cdot \text{trust_term})
 ```
 
